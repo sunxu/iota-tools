@@ -36,7 +36,7 @@ def install(settings: Settings) -> Path:
         "Label": LABEL,
         "ProgramArguments": [sys.executable, "-m", "tah_control.cli", "run"],
         "WorkingDirectory": str(ROOT),
-        "EnvironmentVariables": {"PYTHONPATH": str(ROOT)},
+        "EnvironmentVariables": {"PYTHONPATH": str(ROOT), "IOTA_TOOLS_CONFIG": str(settings.source)},
         "RunAtLoad": True,
         "KeepAlive": True,
         "LimitLoadToSessionType": "Aqua",
