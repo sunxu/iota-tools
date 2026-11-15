@@ -6,10 +6,11 @@ import json
 import os
 from pathlib import Path
 import sys
+import time
 
 from tah_control import macos, services
 from tah_control.config import load_settings, ensure_runtime
-from tah_control.supervisor import Supervisor, desired, set_desired
+from tah_control.supervisor import Supervisor, atomic_json, desired, set_desired
 
 
 def preflight(s) -> dict:
@@ -60,14 +61,19 @@ def main(argv=None) -> int:
             print("LaunchAgent removed; user config and local CA state preserved")
             return 0
         if action in ("start", "restart"):
-            set_desired(settings, "run")
             if action == "restart":
-                # restart is intentionally a desired-state change, not SIGKILL;
-                # the long-running supervisor detects a new launch if needed.
+                atomic_json(settings.runtime / "restart-request.json", {"requested_at": time.time()})
+            set_desired(settings, "run")
+            state_file = settings.runtime / "status.json"
+            try:
+                state = json.loads(state_file.read_text())
+                os.kill(state["supervisor_pid"], 0)
+                active = True
+            except (FileNotFoundError, ValueError, KeyError, OSError, TypeError):
+                active = False
+            if not active:
                 macos.kickstart()
-            else:
-                macos.kickstart()
-            print("Supervisor requested to run")
+            print("Supervisor requested to " + ("restart IOTA" if action == "restart" else "run"))
             return 0
         if action == "stop":
             set_desired(settings, "stop")
