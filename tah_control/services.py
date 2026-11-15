@@ -140,13 +140,14 @@ def start_proxy(settings: Settings) -> subprocess.Popen:
     args = [
         str(mitmdump_path()), "--listen-host", "127.0.0.1", "--listen-port", str(port),
         "--allow-hosts", allowed,
-        "-s", str(ROOT / "speedtest" / "addon.py"),
         "--set", f"confdir={confdir}",
         "--set", "connection_strategy=lazy",
         "--set", "upstream_cert=false",
         "--set", "flow_detail=0",
         "--set", "termlog_verbosity=warn",
     ]
+    if settings.section("speedtest")["enabled"]:
+        args.extend(["-s", str(ROOT / "speedtest" / "addon.py")])
     if settings.section("r2")["enabled"]:
         args.extend(["-s", str(ROOT / "r2_client" / "addon.py")])
     env = clean_env()
