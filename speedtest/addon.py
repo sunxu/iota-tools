@@ -4,10 +4,12 @@ from urllib.parse import urlsplit
 import xml.etree.ElementTree as ET
 
 from mitmproxy import http
+from tah_control.config import load_settings
 
-SERVERS_XML = Path(__file__).with_name("servers.xml").read_bytes()
+port = load_settings().section("speedtest")["port"]
+SERVERS_XML = Path(__file__).with_name("servers.xml").read_bytes().replace(b":8877", f":{port}".encode())
 NODES = ET.fromstring(SERVERS_XML).findall(".//server")
-if len(NODES) != 1 or NODES[0].get("host") != "speedtest.jsqiuying.com:8877":
+if len(NODES) != 1 or NODES[0].get("host") != f"speedtest.jsqiuying.com:{port}":
     raise RuntimeError("pinned local server XML is inconsistent")
 
 
