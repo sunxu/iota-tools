@@ -1,0 +1,30 @@
+name: Test
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install pinned runtime
+        run: python -m pip install -r requirements.txt
+      - name: Compile
+        run: python -m compileall -q tah_control speedtest r2_client tests
+      - name: Test
+        run: python -m unittest discover -s tests -v
+      - name: No forbidden diagnostics or secrets
+        run: |
+          test ! -d iota_observer
+          test ! -e key
+          test ! -e base-ca.pem
+          test ! -e combined-ca.pem
+          test ! -e r2_get_relay.py
+          test ! -e r2_connect_watchdog.py
+          test ! -e bridge_diagnostics.py

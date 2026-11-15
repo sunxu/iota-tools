@@ -1,0 +1,42 @@
+import tempfile
+from pathlib import Path
+import unittest
+
+from tah_control.config import load_settings
+
+
+class SettingsTests(unittest.TestCase):
+    def test_defaults(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = load_settings(Path(tmp) / "missing.toml")
+        self.assertEqual(settings.section("proxy")["port"], 8899)
+        self.assertEqual(settings.section("r2", "upload")["max_concurrency"], 5)
+
+    def test_override_and_unknown_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "local.toml"
+            p.write_text("[r2.upload]\nmax_concurrency=3\n")
+            self.assertEqual(load_settings(p).section("r2", "upload")["max_concurrency"], 3)
+            p.write_text("[r2.upload]\nnot_a_real_field=4\n")
+            with self.assertRaisesRegex(ValueError, "unknown"):
+                load_settings(p)
+
+    def test_schema_and_ranges(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "local.toml"
+            for invalid in ("schema_version=2\n", "[r2.upload]\nmax_concurrency=0\n",
+                            "[proxy]\nport=8877\n", "[speedtest]\nmbps=1000\n"):
+                p.write_text(invalid)
+                with self.assertRaises(ValueError):
+                    load_settings(p)
+
+    def test_reject_proxy_to_non_loopback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "local.toml"
+            p.write_text('[r2.upload]\nprimary_proxy="http://10.0.0.1:18585"\n')
+            with self.assertRaisesRegex(ValueError, "127.0.0.1"):
+                load_settings(p)
+
+
+if __name__ == "__main__":
+    unittest.main()
