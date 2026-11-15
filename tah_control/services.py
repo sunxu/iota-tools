@@ -135,7 +135,7 @@ def start_proxy(settings: Settings) -> subprocess.Popen:
     confdir.mkdir(parents=True, exist_ok=True, mode=0o700)
     confdir.chmod(0o700)
     # mitmproxy will generate a new local CA in its private confdir on first start.
-    allowed = (r"^((www|c)\.speedtest\.net|iota\.api\.macrocosmos\.ai|"
+    allowed = (r"^((www|c)\.speedtest\.net|"
                r"([a-zA-Z0-9-]+\.)*cloudflarestorage\.com)(:[0-9]+)?$")
     args = [
         str(mitmdump_path()), "--listen-host", "127.0.0.1", "--listen-port", str(port),
