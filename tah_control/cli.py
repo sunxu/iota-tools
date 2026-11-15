@@ -36,7 +36,7 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="tah-control")
     p.add_argument("--config", type=Path, help="machine-local TOML override")
     sub = p.add_subparsers(dest="action", required=True)
-    for action in ("install", "uninstall", "start", "stop", "restart", "run",
+    for action in ("install", "uninstall", "start", "stop", "restart", "reload", "run",
                    "status", "check", "logs", "finder"):
         sub.add_parser(action)
     args = p.parse_args(argv)
@@ -74,6 +74,11 @@ def main(argv=None) -> int:
             if not active:
                 macos.kickstart()
             print("Supervisor requested to " + ("restart IOTA" if action == "restart" else "run"))
+            return 0
+        if action == "reload":
+            # load_settings has already validated the requested config.
+            macos.kickstart(restart=True)
+            print("Supervisor reload requested; managed app and proxy will restart")
             return 0
         if action == "stop":
             set_desired(settings, "stop")
