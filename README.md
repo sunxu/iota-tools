@@ -32,6 +32,7 @@ macOS IOTA 工具：版本化配置、单机常驻 Supervisor、独立 Speedtest
 .venv/bin/python -m tah_control.cli start
 .venv/bin/python -m tah_control.cli stop
 .venv/bin/python -m tah_control.cli restart
+.venv/bin/python -m tah_control.cli reload
 .venv/bin/python -m tah_control.cli logs
 .venv/bin/python -m tah_control.cli uninstall
 ./configure-hosts.command remove
@@ -51,7 +52,7 @@ mbps = 400
 max_concurrency = 3
 ```
 
-严格校验配置 schema、字段和端口，拒绝非 loopback 的上游代理地址。修改配置后要重新启动 Supervisor，目前不支持无中断热更新。证书凭据和热钱包密钥不放在配置库中。
+严格校验配置 schema、字段和端口，拒绝非 loopback 的上游代理地址。修改配置后运行 `reload`，会先校验配置、再受控重启 Supervisor、IOTA 与代理（有短暂中断）；目前不支持无中断热更新。证书凭据和热钱包密钥不放在配置库中。
 
 ## 更新恢复与网络边界
 
