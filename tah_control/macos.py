@@ -64,9 +64,13 @@ def uninstall() -> None:
     agent.unlink(missing_ok=True)
 
 
-def kickstart() -> None:
+def kickstart(restart: bool = False) -> None:
     ensure_macos()
-    subprocess.run(["launchctl", "kickstart", domain() + "/" + LABEL], check=True)
+    cmd = ["launchctl", "kickstart"]
+    if restart:
+        cmd.append("-k")  # Controlled restart of the Supervisor and its owned helpers.
+    cmd.append(domain() + "/" + LABEL)
+    subprocess.run(cmd, check=True)
 
 
 def install_finder_app() -> Path:
