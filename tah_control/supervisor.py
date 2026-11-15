@@ -119,11 +119,11 @@ class Supervisor:
             self.speedtest = services.start_speedtest(self.s)
         if self.proxy is None or self.proxy.poll() is not None:
             services.stop_owned(self.proxy)
+            first_ca = not (self.s.runtime / "mitmproxy" / "mitmproxy-ca-cert.pem").exists()
             self.proxy = services.start_proxy(self.s)
             services.wait_proxy(self.s, self.proxy)
-            was_bootstrap = not (self.s.runtime / "combined-ca.pem").exists()
             services.generate_cas(self.s)
-            if was_bootstrap and services.relay_ca_available(self.s):
+            if first_ca and services.relay_ca_available(self.s):
                 # First run: regenerate with upstream trust bundle before any IOTA traffic.
                 services.stop_owned(self.proxy)
                 self.proxy = services.start_proxy(self.s)
@@ -207,9 +207,14 @@ class Supervisor:
 
     def tick(self) -> None:
         if desired(self.s) == "stop":
-            self._stop_everything()
-            self.state = "stopped"
-            self.error = ""
+            try:
+                self._stop_everything()
+                self.state = "stopped"
+                self.error = ""
+            except (RuntimeError, OSError) as exc:
+                # Never tear down proxy if a managed IOTA refuses to stop.
+                self.state = "stop_failed"
+                self.error = str(exc)
             return
         delay = self.s.section("supervisor")["restart_delay_seconds"]
         if time.monotonic() - self.last_service_retry < delay:
@@ -232,8 +237,12 @@ class Supervisor:
             self.error = str(exc)
             self.state = "error"
             self.last_service_retry = time.monotonic()
-            # If a child failed during startup, never retain a partial proxy.
-            if self.proxy and self.proxy.poll() is not None:
+            # Clean up partial startup; do not tear down a running IOTA proxy.
+            if not self.started_app:
+                services.stop_owned(self.proxy)
+                services.stop_owned(self.speedtest)
+                self.proxy = self.speedtest = None
+            elif self.proxy and self.proxy.poll() is not None:
                 self.proxy = None
 
     def run(self) -> None:
