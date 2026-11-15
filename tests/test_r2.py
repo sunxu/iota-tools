@@ -56,6 +56,17 @@ class R2RouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second.server_conn.via, self.router.primary)
         self.assertEqual(self.router.counts["assigned_backup"], 0)
 
+    async def test_waiter_disconnected_is_not_sent(self):
+        first, second = flow(1), flow(2)
+        await self.router.requestheaders(first)
+        waiting = asyncio.create_task(self.router.requestheaders(second))
+        await asyncio.sleep(0.01)
+        self.router.client_disconnected(second.client_conn)
+        await asyncio.wait_for(waiting, 1)
+        self.assertIsNone(second.server_conn.via)
+        self.assertNotIn(id(second), self.router.assignments)
+        self.router.response(first)
+
     async def test_proxy_error_changes_future_route(self):
         first = flow(1)
         await self.router.requestheaders(first)
