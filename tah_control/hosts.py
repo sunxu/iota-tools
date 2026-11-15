@@ -50,7 +50,7 @@ def apply(action: str, path: Path = Path("/etc/hosts")) -> bool:
     finally:
         if os.path.exists(name):
             os.unlink(name)
-    if path == Path("/etc/hosts"):
+    if path == Path("/etc/hosts").resolve():
         subprocess.run(["/usr/bin/dscacheutil", "-flushcache"], check=True)
         subprocess.run(["/usr/bin/killall", "-HUP", "mDNSResponder"], check=True)
     return True
