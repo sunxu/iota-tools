@@ -7,16 +7,13 @@ our environment after an update grace period.
 """
 from __future__ import annotations
 
-from collections import deque
 import fcntl
 import json
 import os
 from pathlib import Path
 import re
 import signal
-import socket
 import subprocess
-import sys
 import time
 
 from tah_control.config import Settings, ensure_runtime
@@ -198,8 +195,9 @@ class Supervisor:
         self._launch_app()
 
     def _stop_everything(self) -> None:
-        if self.owned_pids:
-            _graceful_app_stop(self.s, self.owned_pids)
+        if self.started_app:
+            # Update-launched replacement processes may not be in owned_pids.
+            _graceful_app_stop(self.s, app_pids(self.s))
         self.owned_pids.clear()
         self.started_app = False
         services.stop_owned(self.proxy)
@@ -217,7 +215,16 @@ class Supervisor:
             return
         try:
             self._start_children()
-            self._app_tick()
+            restart = self.s.runtime / "restart-request.json"
+            if restart.is_file():
+                restart.unlink()
+                if self.started_app:
+                    _graceful_app_stop(self.s, app_pids(self.s))
+                    self.owned_pids.clear()
+                    self.started_app = False
+                self._launch_app()
+            else:
+                self._app_tick()
             if self.state != "unmanaged_app":
                 self.error = ""
         except (RuntimeError, OSError, subprocess.SubprocessError, ValueError) as exc:
