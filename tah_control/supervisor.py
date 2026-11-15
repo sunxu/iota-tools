@@ -153,9 +153,10 @@ class Supervisor:
             self.state = "restart_limit"
             return
         environment = services.app_environment(self.s)
-        cmd = ["/usr/bin/open", "-a", str(self.s.app)]
+        cmd = ["/usr/bin/open"]
         for key, value in environment.items():
             cmd += ["--env", f"{key}={value}"]
+        cmd += ["-a", str(self.s.app)]
         # The proxy remains alive independently of the 'open' command.
         subprocess.run(cmd, env=services.clean_env(), check=True, timeout=30)
         self.owned_pids = _wait_for_app(self.s)
