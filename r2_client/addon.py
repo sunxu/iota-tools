@@ -44,6 +44,8 @@ class R2UploadRouter:
             self.failed.add(self.primary)
         self.assignments: dict[int, ServerSpec | str] = {}
         self.flow_clients: dict[int, object] = {}
+        self.waiting_clients: dict[int, object] = {}
+        self.cancelled_waiters: set[int] = set()
         self.target_host: dict[ServerSpec, str] = {}
         self.probes: dict[ServerSpec, asyncio.Task] = {}
         self.capacity = asyncio.Event()
@@ -74,13 +76,19 @@ class R2UploadRouter:
         key = id(flow)
         if key in self.assignments or self.stopping:
             return
-        while not self.stopping:
-            route = self._select()
-            if route != "wait":
-                break
-            event = self.capacity
-            await event.wait()
-        if self.stopping:
+        client_id = getattr(getattr(flow, "client_conn", None), "id", None)
+        try:
+            while not self.stopping and key not in self.cancelled_waiters:
+                route = self._select()
+                if route != "wait":
+                    break
+                event = self.capacity
+                self.waiting_clients[key] = client_id
+                await event.wait()
+        finally:
+            self.waiting_clients.pop(key, None)
+        if self.stopping or key in self.cancelled_waiters:
+            self.cancelled_waiters.discard(key)
             return
         if route == "reject":
             self.counts["rejected"] += 1
@@ -141,6 +149,9 @@ class R2UploadRouter:
 
     def client_disconnected(self, client):
         cid = getattr(client, "id", None)
+        for key, waiting_id in list(self.waiting_clients.items()):
+            if waiting_id == cid:
+                self.cancelled_waiters.add(key)
         for key, value in list(self.flow_clients.items()):
             if value == cid:
                 self.assignments.pop(key, None)
@@ -203,6 +214,8 @@ class R2UploadRouter:
         self.probes.clear()
         self.assignments.clear()
         self.flow_clients.clear()
+        self.waiting_clients.clear()
+        self.cancelled_waiters.clear()
 
 
 addons = [R2UploadRouter()]
