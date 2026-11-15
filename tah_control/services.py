@@ -151,13 +151,15 @@ def start_proxy(settings: Settings) -> subprocess.Popen:
         args.extend(["-s", str(ROOT / "r2_client" / "addon.py")])
     env = clean_env()
     env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
-    relay_ready = relay_ca_available(settings)
+    # Refresh trust from the current on-disk CA files BEFORE accepting uploads.
+    # The very first launch only generates mitmproxy CA, then Supervisor restarts it.
+    if (runtime / "mitmproxy" / "mitmproxy-ca-cert.pem").is_file():
+        generate_cas(settings)
+    trust_path = runtime / "relay-upstream-ca.pem"
+    relay_ready = relay_ca_available(settings) and trust_path.is_file()
     env["IOTA_RELAY_CA_READY"] = "1" if relay_ready else "0"
     if relay_ready:
-        # The trust bundle is created before launching proxy if the local mitm CA exists.
-        trust_path = runtime / "relay-upstream-ca.pem"
-        if trust_path.is_file():
-            args.extend(["--set", f"ssl_verify_upstream_trusted_ca={trust_path}"])
+        args.extend(["--set", f"ssl_verify_upstream_trusted_ca={trust_path}"])
     return subprocess.Popen(args, cwd=ROOT, env=env, start_new_session=True)
 
 
