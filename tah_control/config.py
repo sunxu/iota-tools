@@ -81,6 +81,8 @@ class Settings:
             value = d["supervisor"][name]
             if type(value) not in (int, float) or value <= 0:
                 raise ValueError(f"supervisor.{name} must be positive")
+        if type(d["supervisor"]["max_restarts_per_hour"]) is not int:
+            raise ValueError("supervisor.max_restarts_per_hour must be an integer")
         up = d["r2"]["upload"]
         for name in ("primary_proxy", "fallback_proxy"):
             _proxy_url(up[name], "r2.upload." + name)

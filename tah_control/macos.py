@@ -47,8 +47,8 @@ def install(settings: Settings) -> Path:
     # Avoid silently taking ownership of a different user-managed agent.
     if agent.exists():
         existing = plistlib.loads(agent.read_bytes())
-        if existing.get("Label") != LABEL:
-            raise RuntimeError("unexpected LaunchAgent at target path")
+        if existing.get("Label") != LABEL or existing.get("WorkingDirectory") != str(ROOT):
+            raise RuntimeError("an unrelated LaunchAgent occupies this path; refusing replacement")
         subprocess.run(["launchctl", "bootout", domain() + "/" + LABEL], check=False,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     agent.write_bytes(plistlib.dumps(payload))
@@ -79,6 +79,8 @@ def install_finder_app() -> Path:
     folder = Path.home() / "Applications"
     folder.mkdir(exist_ok=True)
     output = folder / "IOTA Managed.app"
+    if output.exists():
+        raise RuntimeError("IOTA Managed.app already exists; refusing to overwrite an existing Finder app")
     # AppleScript do shell script executes the intended command, without opening Terminal.
     cmd = "cd " + shlex.quote(str(ROOT)) + " && " + shlex.quote(sys.executable) + \
         " -m tah_control.cli start"
