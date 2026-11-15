@@ -63,7 +63,7 @@ def verify_hosts(host: str, port: int) -> None:
 
 
 def mitmdump_path() -> Path:
-    candidate = Path(sys.executable).resolve().parent / "mitmdump"
+    candidate = Path(sys.executable).parent / "mitmdump"
     if candidate.is_file():
         return candidate
     located = shutil.which("mitmdump")
