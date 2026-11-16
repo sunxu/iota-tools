@@ -66,7 +66,7 @@ max_concurrent_takeovers = 8
 
 接管使用相同 URL 和端到端请求头（代理 hop-by-hop 头除外），不构造 Range。若已向客户端交付正文，替换响应必须具有相同强 ETag、状态、长度、Content-Range、Content-Encoding、Content-Type 和 Last-Modified，并重新读取/校验已交付前缀 SHA-256；通过后丢弃前缀，只发送剩余字节。验证失败时继续仍可用的原连接；不能继续则以不完整响应失败，绝不拼接不一致数据。若没有强 ETag 且已有正文交付，则不接管。
 
-运行指标写入用户私有目录 `r2-download-status.json`，`tah-control status` 展示汇总和最后一次事件，不记录签名 URL、认证头或正文。下载与 UploadPart 上传是独立模块、独立并发额度。
+运行指标写入用户私有目录：`r2-download-status.json` 保存当前进程汇总，`r2-download-events.jsonl` 持久保存最近 100 个接管事件。事件区分接管前失败、切换成功、完整传输完成和切换后传输中断，并记录接管后交付字节数、耗时及平均速度；不记录签名 URL、认证头、Cookie、异常原始消息或正文。代理重启后状态计数归零，但事件历史保留。下载与 UploadPart 上传是独立模块、独立并发额度。
 
 ## 更新恢复与网络边界
 

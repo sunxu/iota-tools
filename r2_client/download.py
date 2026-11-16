@@ -36,6 +36,7 @@ _INTERNAL_REQUEST = "X-Iota-Download-Request"
 _FLOW_ID = "iota_r2_download_id"
 _CHUNK_SIZE = 64 * 1024
 _REPLACEMENT_HEADER_TIMEOUT = 20.0
+_EVENT_HISTORY_LIMIT = 100
 _HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade",
@@ -55,6 +56,12 @@ class _RequestContext:
     delivered_hash: Any = field(default_factory=hashlib.sha256)
     takeover_attempted: bool = False
     slot_reserved: bool = False
+    replacement_open_ms: float | None = None
+    prefix_validation_bytes: int = 0
+    prefix_validation_ms: float | None = None
+    replacement_stream_started: float | None = None
+    replacement_bytes: int = 0
+    replacement_stream_completed: bool = False
 
 
 class _RateWindow:
@@ -158,14 +165,25 @@ class R2DownloadRouter:
         self._site: web.TCPSite | None = None
         self._session: ClientSession | None = None
         self._stats = {
-            "eligible_gets": 0, "slow_detected": 0, "takeover_started": 0,
-            "takeover_succeeded": 0, "takeover_failed": 0, "capacity_skipped": 0,
+            "eligible_gets": 0,
+            "slow_detected": 0,
+            "takeover_started": 0,
+            "takeover_succeeded": 0,
+            "takeover_failed": 0,
+            "takeover_completed": 0,
+            "takeover_stream_failed": 0,
+            "takeover_stream_cancelled": 0,
+            "capacity_skipped": 0,
         }
         self._last_event: dict | None = None
 
     @property
     def status_path(self) -> Path:
         return self.settings.runtime / "r2-download-status.json"
+
+    @property
+    def event_history_path(self) -> Path:
+        return self.settings.runtime / "r2-download-events.jsonl"
 
     async def running(self) -> None:
         if not self.enabled:
@@ -307,7 +325,7 @@ class R2DownloadRouter:
                 if (rate is not None and rate < self.threshold_kib_s
                         and not context.takeover_attempted):
                     self._stats["slow_detected"] += 1
-                    self._record(context, "slow_detected", rate=rate)
+                    self._record(context, "slow_detected", rate=rate, stage="slow_window")
                     replacement = await self._try_takeover(context, None, rate)
                     if replacement is not None:
                         if not initial_task.done():
@@ -341,13 +359,16 @@ class R2DownloadRouter:
                         if not downstream.prepared:
                             await downstream.prepare(request)
                         await downstream.write_eof()
+                        if (context.replacement_stream_started is not None
+                                and not context.replacement_stream_completed):
+                            self._complete_replacement(context)
                         return downstream
 
                 rate = window.sample(now)
                 if (rate is not None and rate < self.threshold_kib_s
                         and not context.takeover_attempted):
                     self._stats["slow_detected"] += 1
-                    self._record(context, "slow_detected", rate=rate)
+                    self._record(context, "slow_detected", rate=rate, stage="slow_window")
                     replacement = await self._try_takeover(context, upstream, rate)
                     if replacement is not None:
                         upstream.close()
@@ -365,13 +386,52 @@ class R2DownloadRouter:
                 await downstream.write(data)
                 context.delivered_bytes += len(data)
                 context.delivered_hash.update(data)
+                if context.replacement_stream_started is not None:
+                    context.replacement_bytes += len(data)
 
         except asyncio.CancelledError:
+            if (context.replacement_stream_started is not None
+                    and not context.replacement_stream_completed):
+                self._stats["takeover_stream_cancelled"] += 1
+                self._record(
+                    context,
+                    "takeover_stream_cancelled",
+                    stage="replacement_stream",
+                    reason="CancelledError",
+                    exception_type="CancelledError",
+                    **self._replacement_metrics(context),
+                )
             raise
         except Exception as exc:
-            self._record(context, "relay_error", reason=type(exc).__name__)
-            LOG.warning("R2 download relay failed request_id=%s reason=%s",
-                        context.request_id, type(exc).__name__)
+            if (context.replacement_stream_started is not None
+                    and not context.replacement_stream_completed):
+                self._stats["takeover_stream_failed"] += 1
+                self._record(
+                    context,
+                    "takeover_stream_failed",
+                    stage="replacement_stream",
+                    reason=type(exc).__name__,
+                    exception_type=type(exc).__name__,
+                    **self._replacement_metrics(context),
+                )
+                LOG.warning(
+                    "R2 replacement stream failed request_id=%s reason=%s",
+                    context.request_id,
+                    type(exc).__name__,
+                )
+            else:
+                self._record(
+                    context,
+                    "relay_error",
+                    stage="original_or_relay_stream",
+                    reason=type(exc).__name__,
+                    exception_type=type(exc).__name__,
+                )
+                LOG.warning(
+                    "R2 download relay failed request_id=%s reason=%s",
+                    context.request_id,
+                    type(exc).__name__,
+                )
             if downstream is not None and downstream.prepared:
                 if request.transport:
                     request.transport.close()
@@ -433,41 +493,90 @@ class R2DownloadRouter:
         context.takeover_attempted = True
         if not self._reserve_slot(context):
             self._stats["capacity_skipped"] += 1
-            self._record(context, "capacity_full", rate=rate)
+            self._record(context, "capacity_full", rate=rate, stage="capacity_check")
             return None
 
+        self._record(context, "takeover_started", rate=rate, stage="replacement_open")
         replacement: ClientResponse | None = None
+        stage = "replacement_open"
+        loop = asyncio.get_running_loop()
+        open_started = loop.time()
+        response_status: int | None = None
+        response_content_length: int | None = None
         try:
-            replacement = await asyncio.wait_for(
-                self._open_upstream(context, proxy=self.replacement_proxy),
-                timeout=_REPLACEMENT_HEADER_TIMEOUT,
-            )
+            try:
+                replacement = await asyncio.wait_for(
+                    self._open_upstream(context, proxy=self.replacement_proxy),
+                    timeout=_REPLACEMENT_HEADER_TIMEOUT,
+                )
+            finally:
+                context.replacement_open_ms = (loop.time() - open_started) * 1000
+
+            response_status = replacement.status
+            raw_length = replacement.headers.get("Content-Length")
+            if raw_length is not None:
+                try:
+                    response_content_length = int(raw_length)
+                except ValueError:
+                    response_content_length = None
+
+            stage = "replacement_response_validation"
             if not _response_is_takeover_eligible(replacement, context):
                 raise ValueError("replacement_response_not_eligible")
 
             if context.delivered_bytes:
-                if original is None or not _same_representation(original, replacement):
-                    raise ValueError("replacement_validator_mismatch")
-                digest = hashlib.sha256()
-                remaining = context.delivered_bytes
-                while remaining:
-                    piece = await asyncio.wait_for(
-                        replacement.content.read(min(_CHUNK_SIZE, remaining)),
-                        timeout=_REPLACEMENT_HEADER_TIMEOUT,
-                    )
-                    if not piece:
-                        raise ValueError("replacement_prefix_truncated")
-                    digest.update(piece)
-                    remaining -= len(piece)
-                if digest.digest() != context.delivered_hash.digest():
-                    raise ValueError("replacement_prefix_mismatch")
+                stage = "prefix_validation"
+                prefix_started = loop.time()
+                try:
+                    if original is None or not _same_representation(original, replacement):
+                        raise ValueError("replacement_validator_mismatch")
+                    digest = hashlib.sha256()
+                    remaining = context.delivered_bytes
+                    while remaining:
+                        piece = await asyncio.wait_for(
+                            replacement.content.read(min(_CHUNK_SIZE, remaining)),
+                            timeout=_REPLACEMENT_HEADER_TIMEOUT,
+                        )
+                        if not piece:
+                            raise ValueError("replacement_prefix_truncated")
+                        digest.update(piece)
+                        context.prefix_validation_bytes += len(piece)
+                        remaining -= len(piece)
+                    if digest.digest() != context.delivered_hash.digest():
+                        raise ValueError("replacement_prefix_mismatch")
+                finally:
+                    context.prefix_validation_ms = (loop.time() - prefix_started) * 1000
 
+            context.replacement_stream_started = loop.time()
             self._stats["takeover_succeeded"] += 1
-            self._record(context, "takeover_succeeded", rate=rate)
+            self._record(
+                context,
+                "takeover_succeeded",
+                rate=rate,
+                stage="handoff_ready",
+                response_status=response_status,
+                response_content_length=response_content_length,
+                replacement_open_ms=context.replacement_open_ms,
+                prefix_validation_bytes=context.prefix_validation_bytes,
+                prefix_validation_ms=context.prefix_validation_ms,
+            )
             return replacement
         except asyncio.CancelledError:
             if replacement:
                 replacement.close()
+            self._record(
+                context,
+                "takeover_cancelled",
+                rate=rate,
+                stage=stage,
+                reason="CancelledError",
+                exception_type="CancelledError",
+                replacement_open_ms=context.replacement_open_ms,
+                prefix_validation_bytes=context.prefix_validation_bytes,
+                prefix_validation_ms=context.prefix_validation_ms,
+                response_status=response_status,
+                response_content_length=response_content_length,
+            )
             self._release_slot(context)
             raise
         except Exception as exc:
@@ -478,16 +587,88 @@ class R2DownloadRouter:
                 "replacement_response_not_eligible", "replacement_validator_mismatch",
                 "replacement_prefix_truncated", "replacement_prefix_mismatch",
             }
-            reason = str(exc) if isinstance(exc, ValueError) and str(exc) in safe_reasons else type(exc).__name__
-            self._record(context, "takeover_failed", rate=rate, reason=reason)
+            reason = (
+                str(exc)
+                if isinstance(exc, ValueError) and str(exc) in safe_reasons
+                else type(exc).__name__
+            )
+            self._record(
+                context,
+                "takeover_failed",
+                rate=rate,
+                stage=stage,
+                reason=reason,
+                exception_type=type(exc).__name__,
+                replacement_open_ms=context.replacement_open_ms,
+                prefix_validation_bytes=context.prefix_validation_bytes,
+                prefix_validation_ms=context.prefix_validation_ms,
+                response_status=response_status,
+                response_content_length=response_content_length,
+            )
+            LOG.warning(
+                "R2 takeover failed request_id=%s stage=%s reason=%s",
+                context.request_id,
+                stage,
+                reason,
+            )
             self._release_slot(context)
             return None
 
+    def _replacement_metrics(self, context: _RequestContext) -> dict[str, int | float | None]:
+        started = context.replacement_stream_started
+        if started is None:
+            return {
+                "replacement_bytes": 0,
+                "replacement_elapsed_ms": 0.0,
+                "replacement_avg_kib_s": None,
+            }
+        elapsed_ms = max(0.0, (asyncio.get_running_loop().time() - started) * 1000)
+        elapsed_seconds = elapsed_ms / 1000
+        average = (
+            round(context.replacement_bytes / 1024 / elapsed_seconds, 2)
+            if elapsed_seconds > 0 else None
+        )
+        return {
+            "replacement_bytes": context.replacement_bytes,
+            "replacement_elapsed_ms": round(elapsed_ms, 2),
+            "replacement_avg_kib_s": average,
+        }
+
+    def _complete_replacement(self, context: _RequestContext) -> None:
+        if context.replacement_stream_completed:
+            return
+        context.replacement_stream_completed = True
+        self._stats["takeover_completed"] += 1
+        self._record(
+            context,
+            "takeover_completed",
+            stage="replacement_stream_complete",
+            replacement_open_ms=context.replacement_open_ms,
+            prefix_validation_bytes=context.prefix_validation_bytes,
+            prefix_validation_ms=context.prefix_validation_ms,
+            **self._replacement_metrics(context),
+        )
+
     def _record(
-        self, context: _RequestContext, result: str, rate: float | None = None,
+        self,
+        context: _RequestContext,
+        result: str,
+        rate: float | None = None,
         reason: str | None = None,
+        *,
+        stage: str | None = None,
+        exception_type: str | None = None,
+        response_status: int | None = None,
+        response_content_length: int | None = None,
+        replacement_open_ms: float | None = None,
+        prefix_validation_bytes: int | None = None,
+        prefix_validation_ms: float | None = None,
+        replacement_bytes: int | None = None,
+        replacement_elapsed_ms: float | None = None,
+        replacement_avg_kib_s: float | None = None,
     ) -> None:
-        self._last_event = {
+        event: dict[str, Any] = {
+            "schema": "iota_r2_download_event_v1",
             "request_id": context.request_id,
             "result": result,
             "rate_kib_s": round(rate, 2) if rate is not None else None,
@@ -495,7 +676,57 @@ class R2DownloadRouter:
             "reason": reason,
             "timestamp": time.time(),
         }
+        optional_fields = {
+            "stage": stage,
+            "exception_type": exception_type,
+            "response_status": response_status,
+            "response_content_length": response_content_length,
+            "replacement_open_ms": (
+                round(replacement_open_ms, 2) if replacement_open_ms is not None else None
+            ),
+            "prefix_validation_bytes": prefix_validation_bytes,
+            "prefix_validation_ms": (
+                round(prefix_validation_ms, 2) if prefix_validation_ms is not None else None
+            ),
+            "replacement_bytes": replacement_bytes,
+            "replacement_elapsed_ms": (
+                round(replacement_elapsed_ms, 2)
+                if replacement_elapsed_ms is not None else None
+            ),
+            "replacement_avg_kib_s": replacement_avg_kib_s,
+        }
+        event.update({key: value for key, value in optional_fields.items() if value is not None})
+        self._last_event = event
+        self._append_event_history(event)
         self._write_status()
+
+    def _append_event_history(self, event: dict[str, Any]) -> None:
+        path = self.event_history_path
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            path.parent.chmod(0o700)
+            encoded = (
+                json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+            ).encode("utf-8")
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            with os.fdopen(fd, "ab") as stream:
+                stream.write(encoded)
+                stream.flush()
+                os.fsync(stream.fileno())
+
+            with path.open("rb") as stream:
+                lines = stream.readlines()
+            if len(lines) > _EVENT_HISTORY_LIMIT:
+                temp = path.with_name(path.name + ".tmp")
+                fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(b"".join(lines[-_EVENT_HISTORY_LIMIT:]))
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temp, path)
+                path.chmod(0o600)
+        except OSError:
+            LOG.warning("Unable to update private R2 download event history")
 
     def _write_status(self) -> None:
         path = self.status_path
@@ -511,6 +742,8 @@ class R2DownloadRouter:
                 "max_concurrent_takeovers": self.max_concurrent,
                 "slow_threshold_kib_s": self.threshold_kib_s,
                 "slow_window_seconds": self.window_seconds,
+                "event_history_file": self.event_history_path.name,
+                "event_history_limit": _EVENT_HISTORY_LIMIT,
                 **self._stats,
                 "last_event": self._last_event,
             }

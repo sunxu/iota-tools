@@ -41,6 +41,10 @@ mitmproxy 11.0.2 的响应流回调是同步函数。它适合对单个 chunk �
 
 - 内部 relay 仅绑定 127.0.0.1 的动态端口，不增加独立 Supervisor 子进程。
 - 全局接管并发名额在新代理连接、前缀验证及剩余正文传输期间占用；完成、失败、取消均释放。
-- `r2-download-status.json` 仅记录计数、随机 request_id、速率、交付字节数和失败原因。
-- 不记录原始 URL、签名查询参数、认证请求头或响应正文。
+- `r2-download-status.json` 记录当前代理进程的计数、最后事件和事件历史文件名；进程重启后计数归零。
+- `r2-download-events.jsonl` 独立追加事件，最多保留最近 100 个事件；目录权限为 0700，文件权限为 0600，代理重启后历史保留。
+- `takeover_succeeded` 表示替代响应通过校验并完成切换；`takeover_completed` 才表示替代响应正文已完整交付。
+- 事件记录接管阶段、异常类型、替代响应建立耗时、前缀校验耗时/字节数，以及接管后交付字节数、耗时和平均 KiB/s。
+- `takeover_failed` 表示切换前失败；`takeover_stream_failed` 表示切换成功后传输中断；客户端取消单独记为 `takeover_stream_cancelled`。
+- 不记录原始 URL、签名查询参数、认证请求头、Cookie、异常原始消息或响应正文；失败原因只记录固定校验原因或异常类型。
 - 真实 Mac / IOTA / R2 验收仍是发布前置条件。

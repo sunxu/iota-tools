@@ -1,8 +1,11 @@
 import asyncio
+import json
+import stat
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, PropertyMock, patch
 
 from aiohttp import web
 from multidict import CIMultiDict
@@ -15,7 +18,7 @@ from r2_client.download import (
     _same_representation,
 )
 from r2_client.eligibility import is_r2_object_get
-from tah_control.config import load_settings
+from tah_control.config import Settings, load_settings
 
 
 HOST = "assets.1234567890abcdef.r2.cloudflarestorage.com"
@@ -71,6 +74,14 @@ class ValidatorTests(unittest.TestCase):
 
 class DownloadRouterUnitTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        self._runtime_tmp = tempfile.TemporaryDirectory()
+        self._runtime_patch = patch.object(
+            Settings,
+            "runtime",
+            new_callable=PropertyMock,
+            return_value=Path(self._runtime_tmp.name),
+        )
+        self._runtime_patch.start()
         with tempfile.TemporaryDirectory() as tmp:
             local = Path(tmp) / "config.toml"
             local.write_text(
@@ -82,7 +93,11 @@ class DownloadRouterUnitTests(unittest.IsolatedAsyncioTestCase):
         await self.router.running()
 
     async def asyncTearDown(self):
-        await self.router.done()
+        try:
+            await self.router.done()
+        finally:
+            self._runtime_patch.stop()
+            self._runtime_tmp.cleanup()
 
     async def test_request_is_rewritten_to_private_loopback_relay(self):
         request = http.Request.make("GET", f"https://{HOST}/object?X-Amz-Signature=private",
@@ -124,6 +139,57 @@ class DownloadRouterUnitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.router._active_takeovers, 2)
         for context in contexts:
             self.router._release_slot(context)
+
+    async def test_takeover_failure_persists_safe_stage_and_reason(self):
+        context = _RequestContext(
+            request_id="failure-test",
+            url="https://assets.example.r2.cloudflarestorage.com/object?X-Amz-Signature=private-signature",
+            headers=((b"Authorization", b"private-authorization"),),
+            client_id="test-client",
+            range_requested=False,
+            started=asyncio.get_running_loop().time(),
+        )
+        self.router._open_upstream = AsyncMock(
+            side_effect=RuntimeError("private-signature private-authorization")
+        )
+
+        result = await self.router._try_takeover(context, None, 4.25)
+
+        self.assertIsNone(result)
+        self.assertEqual(self.router._stats["takeover_failed"], 1)
+        self.assertEqual(self.router._active_takeovers, 0)
+        event = self.router._last_event
+        self.assertEqual(event["result"], "takeover_failed")
+        self.assertEqual(event["stage"], "replacement_open")
+        self.assertEqual(event["reason"], "RuntimeError")
+        self.assertEqual(event["exception_type"], "RuntimeError")
+
+        raw = self.router.event_history_path.read_text(encoding="utf-8")
+        self.assertNotIn("private-signature", raw)
+        self.assertNotIn("private-authorization", raw)
+        self.assertNotIn("X-Amz-Signature", raw)
+
+    async def test_event_history_is_private_and_retains_last_100_events(self):
+        context = _RequestContext(
+            request_id="history-test",
+            url="https://assets.example.r2.cloudflarestorage.com/object",
+            headers=(),
+            client_id="test-client",
+            range_requested=False,
+            started=asyncio.get_running_loop().time(),
+        )
+
+        for index in range(105):
+            self.router._record(context, f"test_event_{index}", rate=1.0)
+
+        path = self.router.event_history_path
+        events = [json.loads(line) for line in path.read_text().splitlines()]
+
+        self.assertEqual(len(events), 100)
+        self.assertEqual(events[0]["result"], "test_event_5")
+        self.assertEqual(events[-1]["result"], "test_event_104")
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
 
     async def test_relay_streams_and_takes_over_a_slow_request(self):
         body = bytes(range(256)) * 64
@@ -198,7 +264,25 @@ class DownloadRouterUnitTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("signature=unchanged", proxy_requests[0][0])
             self.assertEqual(proxy_requests[0][1], "preserved")
             self.assertEqual(self.router._stats["takeover_succeeded"], 1)
+            self.assertEqual(self.router._stats["takeover_completed"], 1)
             self.assertEqual(self.router._active_takeovers, 0)
+
+            events = [
+                json.loads(line)
+                for line in self.router.event_history_path.read_text().splitlines()
+            ]
+            succeeded = next(e for e in events if e["result"] == "takeover_succeeded")
+            completed = next(e for e in events if e["result"] == "takeover_completed")
+            self.assertEqual(
+                succeeded["prefix_validation_bytes"],
+                succeeded["delivered_bytes"],
+            )
+            self.assertEqual(
+                completed["replacement_bytes"] + succeeded["delivered_bytes"],
+                len(body),
+            )
+            self.assertGreater(completed["replacement_elapsed_ms"], 0)
+            self.assertGreater(completed["replacement_avg_kib_s"], 0)
         finally:
             await slow_runner.cleanup()
             await proxy_runner.cleanup()
