@@ -487,7 +487,7 @@ class R2DownloadRouter:
                 if request.transport:
                     request.transport.close()
                 return downstream
-            return web.Response(status=502, text="R2 replacement download stalled\\n")
+            return web.Response(status=502, text="R2 replacement download stalled\n")
         except asyncio.CancelledError:
             context.final_status = "cancelled"
             if (context.replacement_stream_started is not None

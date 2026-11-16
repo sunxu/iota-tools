@@ -14,6 +14,7 @@ from mitmproxy import http
 from r2_client.download import (
     R2DownloadRouter,
     _RateWindow,
+    _REPLACEMENT_STREAM_STALL_TIMEOUT,
     _RequestContext,
     _same_representation,
     _progress_percent,
@@ -60,6 +61,9 @@ class RateWindowTests(unittest.TestCase):
 
 
 class ProgressTests(unittest.TestCase):
+    def test_replacement_stream_stall_timeout_is_30_seconds(self):
+        self.assertEqual(_REPLACEMENT_STREAM_STALL_TIMEOUT, 30.0)
+
     def test_progress_is_unknown_without_a_positive_content_length(self):
         self.assertIsNone(_progress_percent(10, None))
         self.assertIsNone(_progress_percent(10, 0))
@@ -132,10 +136,8 @@ class DownloadRouterUnitTests(unittest.IsolatedAsyncioTestCase):
             if original_prefix:
                 await response.write(original_prefix)
             await stall_release.wait()
-            try:
-                await response.write_eof()
-            except (ConnectionResetError, RuntimeError):
-                pass
+            if request.transport:
+                request.transport.close()
             return response
 
         async def replacement_proxy(request):
@@ -151,10 +153,8 @@ class DownloadRouterUnitTests(unittest.IsolatedAsyncioTestCase):
             if replacement_prefix:
                 await response.write(replacement_prefix)
             await stall_release.wait()
-            try:
-                await response.write_eof()
-            except (ConnectionResetError, RuntimeError):
-                pass
+            if request.transport:
+                request.transport.close()
             return response
 
         async def start_server(handler):
@@ -263,10 +263,8 @@ class DownloadRouterUnitTests(unittest.IsolatedAsyncioTestCase):
             )
             await response.prepare(request)
             await stall_release.wait()
-            try:
-                await response.write_eof()
-            except (ConnectionResetError, RuntimeError):
-                pass
+            if request.transport:
+                request.transport.close()
             return response
 
         async def replacement_proxy(request):
@@ -278,9 +276,9 @@ class DownloadRouterUnitTests(unittest.IsolatedAsyncioTestCase):
             await response.prepare(request)
             proxy_seen.set()
             await response.write(b"a")
-            await asyncio.sleep(0.08)
+            await asyncio.sleep(0.2)
             await response.write(b"b")
-            await asyncio.sleep(0.08)
+            await asyncio.sleep(0.2)
             await response.write(b"c")
             await response.write_eof()
             return response
@@ -309,7 +307,7 @@ class DownloadRouterUnitTests(unittest.IsolatedAsyncioTestCase):
         )
         self.router._contexts[request_id] = context
         try:
-            with patch("r2_client.download._REPLACEMENT_STREAM_STALL_TIMEOUT", 0.1):
+            with patch("r2_client.download._REPLACEMENT_STREAM_STALL_TIMEOUT", 0.3):
                 async with ClientSessionForTest() as client:
                     response = await client.get(
                         f"http://127.0.0.1:{self.router._port}/{request_id}",
