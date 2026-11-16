@@ -9,7 +9,7 @@ macOS IOTA 工具：版本化配置、单机常驻 Supervisor、独立 Speedtest
 - `tah_control/`：用户 LaunchAgent、进程管理、更新宽限期、重启限制、私有 CA 和 Finder 启动。
 - `speedtest/`：本地 HTTP Speedtest 服务与测速列表替换。它是模拟数据，不代表真实公网性能。
 - `r2_client/upload.py`：仅处理 R2 UploadPart PUT；18585 最多五并发、满额等待、7890 备用路线、CONNECT 故障恢复探测。
-- `r2_client/download.py`：只处理 R2 对象 GET；500 KiB/s、10 秒滚动窗口，慢请求最多接管一次，固定代理重新下载并校验已交付前缀；全局并发接管默认 8。
+- `r2_client/download.py`：只处理 R2 对象 GET；500 KiB/s、10 秒滚动窗口，慢请求最多接管一次，固定代理重新下载并校验已交付前缀；全局并发接管默认 16。
 - `r2_client/addon.py`：独立注册上传和下载模块。下载中继仅在 mitmdump 进程内绑定随机 loopback 端口，不增加独立守护进程。
 - `r2-relay` 是独立的现有仓库；这里不重复实现本地 18585 或 VPS 中继。
 
@@ -55,7 +55,7 @@ max_concurrency = 3
 
 [r2.download]
 replacement_proxy = "http://127.0.0.1:7893"
-max_concurrent_takeovers = 8
+max_concurrent_takeovers = 16
 ```
 
 下载默认使用 500 KiB/s、10 秒滚动窗口；配置可覆盖阈值、窗口、替换代理和全局接管并发（1–64）。单个 GET 最多接管一次，接管名额满时立即放弃接管、不排队。修改配置后运行 `reload`，会先校验配置、再受控重启 Supervisor、IOTA 与代理（有短暂中断）；目前不支持无中断热更新。证书凭据和热钱包密钥不放在配置库中。
