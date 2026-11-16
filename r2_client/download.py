@@ -36,11 +36,16 @@ _INTERNAL_REQUEST = "X-Iota-Download-Request"
 _FLOW_ID = "iota_r2_download_id"
 _CHUNK_SIZE = 64 * 1024
 _REPLACEMENT_HEADER_TIMEOUT = 20.0
+_REPLACEMENT_STREAM_STALL_TIMEOUT = 30.0
 _EVENT_HISTORY_LIMIT = 1000
 _HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade",
 }
+
+
+class _ReplacementStreamStalled(Exception):
+    """The replacement response body made no progress within its stall timeout."""
 
 
 @dataclass
@@ -202,6 +207,7 @@ class R2DownloadRouter:
             "takeover_completed": 0,
             "takeover_stream_failed": 0,
             "takeover_stream_cancelled": 0,
+            "takeover_stream_stalled": 0,
             "capacity_skipped": 0,
             "takeover_slot_released": 0,
             "download_summaries": 0,
@@ -372,6 +378,7 @@ class R2DownloadRouter:
         initial_task: asyncio.Task | None = None
         upstream: ClientResponse | None = None
         downstream: web.StreamResponse | None = None
+        replacement_last_data_at: float | None = None
         try:
             window = _RateWindow(context.started, self.window_seconds)
             initial_task = asyncio.create_task(self._open_upstream(context))
@@ -393,6 +400,7 @@ class R2DownloadRouter:
                             if original_result is not replacement:
                                 original_result.close()
                         upstream = replacement
+                        replacement_last_data_at = asyncio.get_running_loop().time()
                         break
 
             if upstream is None:
@@ -404,15 +412,26 @@ class R2DownloadRouter:
                 return await self._stream_without_takeover(request, upstream, context)
 
             while True:
+                loop = asyncio.get_running_loop()
+                read_timeout = 1.0
+                if replacement_last_data_at is not None:
+                    remaining = _REPLACEMENT_STREAM_STALL_TIMEOUT - (
+                        loop.time() - replacement_last_data_at
+                    )
+                    read_timeout = min(read_timeout, max(0.001, remaining))
                 try:
-                    data = await asyncio.wait_for(upstream.content.read(_CHUNK_SIZE), timeout=1.0)
+                    data = await asyncio.wait_for(
+                        upstream.content.read(_CHUNK_SIZE), timeout=read_timeout
+                    )
                 except asyncio.TimeoutError:
                     data = None
 
-                now = asyncio.get_running_loop().time()
+                now = loop.time()
                 if data is not None:
                     if data:
                         window.add(now, len(data))
+                        if replacement_last_data_at is not None:
+                            replacement_last_data_at = now
                     else:
                         if downstream is None:
                             downstream = self._make_downstream(upstream)
@@ -425,6 +444,16 @@ class R2DownloadRouter:
                         context.final_status = "completed"
                         return downstream
 
+                if (
+                    data is None
+                    and replacement_last_data_at is not None
+                    and now - replacement_last_data_at >= _REPLACEMENT_STREAM_STALL_TIMEOUT
+                ):
+                    self._record_replacement_stream_stalled(
+                        context, stage="replacement_stream"
+                    )
+                    raise _ReplacementStreamStalled()
+
                 rate = window.sample(now)
                 self._observe_rate(context, rate)
                 if (rate is not None and rate < self.threshold_kib_s
@@ -435,6 +464,7 @@ class R2DownloadRouter:
                         upstream.close()
                         upstream = replacement
                         self._set_response_metadata(context, upstream)
+                        replacement_last_data_at = asyncio.get_running_loop().time()
                         if downstream is None or not downstream.prepared:
                             downstream = self._make_downstream(upstream)
                         continue
@@ -451,6 +481,13 @@ class R2DownloadRouter:
                 if context.replacement_stream_started is not None:
                     context.replacement_bytes += len(data)
 
+        except _ReplacementStreamStalled:
+            context.final_status = "failed"
+            if downstream is not None and downstream.prepared:
+                if request.transport:
+                    request.transport.close()
+                return downstream
+            return web.Response(status=502, text="R2 replacement download stalled\\n")
         except asyncio.CancelledError:
             context.final_status = "cancelled"
             if (context.replacement_stream_started is not None
@@ -608,7 +645,9 @@ class R2DownloadRouter:
             context.delivered_bytes, context.response_content_length
         )
 
-        if context.replacement_stream_completed:
+        if context.takeover_skip_reason == "REPLACEMENT_STREAM_STALLED":
+            takeover_result = "stalled"
+        elif context.replacement_stream_completed:
             takeover_result = "completed"
         elif context.replacement_stream_started is not None:
             if context.final_status == "cancelled":
@@ -627,7 +666,9 @@ class R2DownloadRouter:
         if context.final_status == "cancelled":
             skip_reason = "REQUEST_CANCELLED"
         elif context.final_status == "failed":
-            if (context.replacement_stream_started is not None
+            if context.takeover_skip_reason == "REPLACEMENT_STREAM_STALLED":
+                skip_reason = "REPLACEMENT_STREAM_STALLED"
+            elif (context.replacement_stream_started is not None
                     and not context.replacement_stream_completed):
                 skip_reason = "REPLACEMENT_STREAM_FAILED"
             elif context.takeover_attempted and context.replacement_stream_started is None:
@@ -734,7 +775,7 @@ class R2DownloadRouter:
                     while remaining:
                         piece = await asyncio.wait_for(
                             replacement.content.read(min(_CHUNK_SIZE, remaining)),
-                            timeout=_REPLACEMENT_HEADER_TIMEOUT,
+                            timeout=_REPLACEMENT_STREAM_STALL_TIMEOUT,
                         )
                         if not piece:
                             raise ValueError("replacement_prefix_truncated")
@@ -781,6 +822,10 @@ class R2DownloadRouter:
         except Exception as exc:
             if replacement:
                 replacement.close()
+            if stage == "prefix_validation" and isinstance(exc, asyncio.TimeoutError):
+                self._record_replacement_stream_stalled(context, stage=stage)
+                self._release_slot(context)
+                raise _ReplacementStreamStalled() from exc
             self._stats["takeover_failed"] += 1
             safe_reasons = {
                 "replacement_response_not_eligible", "replacement_validator_mismatch",
@@ -812,6 +857,35 @@ class R2DownloadRouter:
             )
             self._release_slot(context)
             return None
+
+    def _record_replacement_stream_stalled(
+        self, context: _RequestContext, *, stage: str
+    ) -> None:
+        if context.takeover_skip_reason == "REPLACEMENT_STREAM_STALLED":
+            return
+        context.final_status = "failed"
+        context.takeover_skip_reason = "REPLACEMENT_STREAM_STALLED"
+        self._stats["takeover_stream_stalled"] += 1
+        self._record(
+            context,
+            "takeover_stream_stalled",
+            stage=stage,
+            reason="REPLACEMENT_STREAM_STALLED",
+            exception_type="TimeoutError",
+            replacement_open_ms=context.replacement_open_ms,
+            prefix_validation_bytes=context.prefix_validation_bytes,
+            prefix_validation_ms=context.prefix_validation_ms,
+            extra_fields={
+                "stall_timeout_seconds": _REPLACEMENT_STREAM_STALL_TIMEOUT,
+            },
+            **self._replacement_metrics(context),
+        )
+        LOG.warning(
+            "R2 replacement stream stalled request_id=%s stage=%s timeout_seconds=%s",
+            context.request_id,
+            stage,
+            _REPLACEMENT_STREAM_STALL_TIMEOUT,
+        )
 
     def _replacement_metrics(self, context: _RequestContext) -> dict[str, int | float | None]:
         started = context.replacement_stream_started

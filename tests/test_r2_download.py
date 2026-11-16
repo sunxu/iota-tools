@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, PropertyMock, patch
 
-from aiohttp import web
+from aiohttp import ClientPayloadError, web
 from multidict import CIMultiDict
 from mitmproxy import http
 
@@ -110,6 +110,225 @@ class DownloadRouterUnitTests(unittest.IsolatedAsyncioTestCase):
         finally:
             self._runtime_patch.stop()
             self._runtime_tmp.cleanup()
+
+    async def _run_replacement_stall_case(
+        self, *, original_prefix: bytes, replacement_prefix: bytes, expected_stage: str
+    ):
+        body = bytes(range(64))
+        stall_release = asyncio.Event()
+        proxy_seen = asyncio.Event()
+        origin_requests = 0
+        proxy_requests = 0
+
+        async def slow_origin(request):
+            nonlocal origin_requests
+            origin_requests += 1
+            response = web.StreamResponse(
+                status=200,
+                headers={"ETag": '"same-object"', "Content-Length": str(len(body)),
+                         "Content-Type": "application/octet-stream"},
+            )
+            await response.prepare(request)
+            if original_prefix:
+                await response.write(original_prefix)
+            await stall_release.wait()
+            try:
+                await response.write_eof()
+            except (ConnectionResetError, RuntimeError):
+                pass
+            return response
+
+        async def replacement_proxy(request):
+            nonlocal proxy_requests
+            proxy_requests += 1
+            response = web.StreamResponse(
+                status=200,
+                headers={"ETag": '"same-object"', "Content-Length": str(len(body)),
+                         "Content-Type": "application/octet-stream"},
+            )
+            await response.prepare(request)
+            proxy_seen.set()
+            if replacement_prefix:
+                await response.write(replacement_prefix)
+            await stall_release.wait()
+            try:
+                await response.write_eof()
+            except (ConnectionResetError, RuntimeError):
+                pass
+            return response
+
+        async def start_server(handler):
+            app = web.Application()
+            app.router.add_route("*", "/{tail:.*}", handler)
+            runner = web.AppRunner(app, access_log=None)
+            await runner.setup()
+            site = web.TCPSite(runner, "127.0.0.1", 0)
+            await site.start()
+            port = site._server.sockets[0].getsockname()[1]
+            return runner, port
+
+        slow_runner, slow_port = await start_server(slow_origin)
+        proxy_runner, proxy_port = await start_server(replacement_proxy)
+        self.router.replacement_proxy = f"http://127.0.0.1:{proxy_port}"
+        request_id = f"stall-{expected_stage}"
+        context = _RequestContext(
+            request_id=request_id,
+            url=f"http://127.0.0.1:{slow_port}/object?signature=unchanged",
+            headers=((b"Host", f"127.0.0.1:{slow_port}".encode()),),
+            client_id="stall-test-client",
+            range_requested=False,
+            started=asyncio.get_running_loop().time(),
+        )
+        self.router._contexts[request_id] = context
+        try:
+            with patch("r2_client.download._REPLACEMENT_STREAM_STALL_TIMEOUT", 0.05):
+                async with ClientSessionForTest() as client:
+                    response = await client.get(
+                        f"http://127.0.0.1:{self.router._port}/{request_id}",
+                        headers={
+                            "X-Iota-Download-Token": self.router._token,
+                            "X-Iota-Download-Request": request_id,
+                        },
+                    )
+                    expected_prefix = original_prefix or replacement_prefix
+                    if expected_prefix:
+                        self.assertEqual(response.status, 200)
+                        self.assertEqual(
+                            await response.content.readexactly(len(expected_prefix)),
+                            expected_prefix,
+                        )
+                        with self.assertRaises(ClientPayloadError):
+                            await response.read()
+                    else:
+                        self.assertEqual(response.status, 502)
+                        self.assertIn("stalled", await response.text())
+
+            await asyncio.wait_for(proxy_seen.wait(), timeout=1.0)
+            events = [
+                json.loads(line)
+                for line in self.router.event_history_path.read_text().splitlines()
+            ]
+            stalled = [event for event in events if event["result"] == "takeover_stream_stalled"]
+            self.assertEqual(len(stalled), 1)
+            self.assertEqual(stalled[0]["stage"], expected_stage)
+            self.assertEqual(stalled[0]["reason"], "REPLACEMENT_STREAM_STALLED")
+            self.assertEqual(stalled[0]["stall_timeout_seconds"], 0.05)
+            summary = next(event for event in events if event["result"] == "download_summary")
+            self.assertEqual(summary["final_status"], "failed")
+            self.assertEqual(summary["takeover_result"], "stalled")
+            self.assertEqual(summary["skip_reason"], "REPLACEMENT_STREAM_STALLED")
+            self.assertIsNotNone(summary["slot_held_ms"])
+            self.assertEqual(origin_requests, 1)
+            self.assertEqual(proxy_requests, 1)
+            self.assertEqual(self.router._stats["takeover_stream_stalled"], 1)
+            self.assertEqual(self.router._stats["takeover_stream_failed"], 0)
+            self.assertEqual(self.router._active_takeovers, 0)
+            self.assertFalse(context.slot_reserved)
+        finally:
+            stall_release.set()
+            await slow_runner.cleanup()
+            await proxy_runner.cleanup()
+
+    async def test_replacement_stream_stall_before_downstream_headers_returns_502(self):
+        await self._run_replacement_stall_case(
+            original_prefix=b"",
+            replacement_prefix=b"",
+            expected_stage="replacement_stream",
+        )
+
+    async def test_replacement_stream_stall_after_body_starts_closes_partial_response(self):
+        await self._run_replacement_stall_case(
+            original_prefix=b"",
+            replacement_prefix=b"prefix",
+            expected_stage="replacement_stream",
+        )
+
+    async def test_replacement_prefix_validation_stall_does_not_fall_back(self):
+        await self._run_replacement_stall_case(
+            original_prefix=b"prefix",
+            replacement_prefix=b"",
+            expected_stage="prefix_validation",
+        )
+
+    async def test_replacement_stream_data_resets_stall_timeout(self):
+        body = b"abc"
+        stall_release = asyncio.Event()
+        proxy_seen = asyncio.Event()
+
+        async def slow_origin(request):
+            response = web.StreamResponse(
+                status=200,
+                headers={"ETag": '"same-object"', "Content-Length": str(len(body)),
+                         "Content-Type": "application/octet-stream"},
+            )
+            await response.prepare(request)
+            await stall_release.wait()
+            try:
+                await response.write_eof()
+            except (ConnectionResetError, RuntimeError):
+                pass
+            return response
+
+        async def replacement_proxy(request):
+            response = web.StreamResponse(
+                status=200,
+                headers={"ETag": '"same-object"', "Content-Length": str(len(body)),
+                         "Content-Type": "application/octet-stream"},
+            )
+            await response.prepare(request)
+            proxy_seen.set()
+            await response.write(b"a")
+            await asyncio.sleep(0.08)
+            await response.write(b"b")
+            await asyncio.sleep(0.08)
+            await response.write(b"c")
+            await response.write_eof()
+            return response
+
+        async def start_server(handler):
+            app = web.Application()
+            app.router.add_route("*", "/{tail:.*}", handler)
+            runner = web.AppRunner(app, access_log=None)
+            await runner.setup()
+            site = web.TCPSite(runner, "127.0.0.1", 0)
+            await site.start()
+            port = site._server.sockets[0].getsockname()[1]
+            return runner, port
+
+        slow_runner, slow_port = await start_server(slow_origin)
+        proxy_runner, proxy_port = await start_server(replacement_proxy)
+        self.router.replacement_proxy = f"http://127.0.0.1:{proxy_port}"
+        request_id = "stall-reset-test"
+        context = _RequestContext(
+            request_id=request_id,
+            url=f"http://127.0.0.1:{slow_port}/object",
+            headers=((b"Host", f"127.0.0.1:{slow_port}".encode()),),
+            client_id="stall-reset-client",
+            range_requested=False,
+            started=asyncio.get_running_loop().time(),
+        )
+        self.router._contexts[request_id] = context
+        try:
+            with patch("r2_client.download._REPLACEMENT_STREAM_STALL_TIMEOUT", 0.1):
+                async with ClientSessionForTest() as client:
+                    response = await client.get(
+                        f"http://127.0.0.1:{self.router._port}/{request_id}",
+                        headers={
+                            "X-Iota-Download-Token": self.router._token,
+                            "X-Iota-Download-Request": request_id,
+                        },
+                    )
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(await response.read(), body)
+
+            self.assertTrue(proxy_seen.is_set())
+            self.assertEqual(self.router._stats["takeover_completed"], 1)
+            self.assertEqual(self.router._stats["takeover_stream_stalled"], 0)
+            self.assertEqual(self.router._active_takeovers, 0)
+        finally:
+            stall_release.set()
+            await slow_runner.cleanup()
+            await proxy_runner.cleanup()
 
     async def test_request_is_rewritten_to_private_loopback_relay(self):
         request = http.Request.make("GET", f"https://{HOST}/object?X-Amz-Signature=private",
