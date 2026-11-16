@@ -1,0 +1,516 @@
+"""Slow R2 GET detection and one-shot proxy takeover.
+
+A tiny loopback HTTP relay owns the asynchronous upstream streams. mitmproxy
+rewrites eligible GETs to this relay and streams its response to the IOTA client.
+This avoids blocking mitmproxy's synchronous response.stream callback.
+"""
+from __future__ import annotations
+
+import asyncio
+from collections import deque
+from contextlib import suppress
+from dataclasses import dataclass, field
+import hashlib
+import hmac
+import json
+import logging
+import os
+from pathlib import Path
+import secrets
+import ssl
+import time
+from typing import Any
+
+import certifi
+from aiohttp import ClientResponse, ClientSession, ClientTimeout, TCPConnector, web
+from multidict import CIMultiDict
+from mitmproxy import http
+from yarl import URL
+
+from r2_client.eligibility import is_r2_object_get
+from tah_control.config import Settings, ensure_runtime, load_settings
+
+LOG = logging.getLogger("iota.r2.download")
+_INTERNAL_TOKEN = "X-Iota-Download-Token"
+_INTERNAL_REQUEST = "X-Iota-Download-Request"
+_FLOW_ID = "iota_r2_download_id"
+_CHUNK_SIZE = 64 * 1024
+_REPLACEMENT_HEADER_TIMEOUT = 20.0
+_HOP_BY_HOP = {
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade",
+}
+
+
+@dataclass
+class _RequestContext:
+    request_id: str
+    url: str
+    headers: tuple[tuple[bytes, bytes], ...]
+    client_id: object
+    range_requested: bool
+    started: float
+    task: asyncio.Task | None = None
+    delivered_bytes: int = 0
+    delivered_hash: Any = field(default_factory=hashlib.sha256)
+    takeover_attempted: bool = False
+    slot_reserved: bool = False
+
+
+class _RateWindow:
+    """A rolling byte counter. The first complete window starts at request creation."""
+
+    def __init__(self, started: float, window_seconds: int) -> None:
+        self.started = started
+        self.window_seconds = window_seconds
+        self.samples: deque[tuple[float, int]] = deque()
+        self.total = 0
+        self.next_check = started + 1.0
+
+    def add(self, timestamp: float, size: int) -> None:
+        if size > 0:
+            self.samples.append((timestamp, size))
+            self.total += size
+
+    def sample(self, now: float) -> float | None:
+        if now < self.next_check:
+            return None
+        self.next_check = now + 1.0
+        if now - self.started < self.window_seconds:
+            return None
+        cutoff = now - self.window_seconds
+        while self.samples and self.samples[0][0] < cutoff:
+            _, size = self.samples.popleft()
+            self.total -= size
+        return self.total / (self.window_seconds * 1024)
+
+
+def _connection_tokens(headers) -> set[str]:
+    tokens: set[str] = set()
+    for value in headers.getall("Connection", []):
+        tokens.update(piece.strip().lower() for piece in value.split(",") if piece.strip())
+    return tokens
+
+
+def _forward_request_headers(raw_headers) -> CIMultiDict:
+    headers = CIMultiDict()
+    original = CIMultiDict(
+        [(name.decode("latin-1"), value.decode("latin-1")) for name, value in raw_headers]
+    )
+    tokens = _connection_tokens(original)
+    for raw_name, raw_value in raw_headers:
+        name = raw_name.decode("latin-1")
+        value = raw_value.decode("latin-1")
+        lower = name.lower()
+        if lower in _HOP_BY_HOP or lower in tokens:
+            continue
+        headers.add(name, value)
+    return headers
+
+
+def _response_headers(response: ClientResponse) -> CIMultiDict:
+    headers = CIMultiDict()
+    tokens = _connection_tokens(response.headers)
+    for raw_name, raw_value in response.raw_headers:
+        name = raw_name.decode("latin-1")
+        lower = name.lower()
+        if lower in _HOP_BY_HOP or lower in tokens:
+            continue
+        headers.add(name, raw_value.decode("latin-1"))
+    return headers
+
+
+def _response_is_takeover_eligible(response: ClientResponse, ctx: _RequestContext) -> bool:
+    if ctx.range_requested:
+        return response.status == 206 and bool(response.headers.get("Content-Range"))
+    return response.status == 200
+
+
+def _same_representation(old: ClientResponse, new: ClientResponse) -> bool:
+    if old.status != new.status:
+        return False
+    etag = old.headers.get("ETag", "")
+    if not etag or etag.lstrip().lower().startswith("w/"):
+        return False
+    if new.headers.get("ETag", "") != etag:
+        return False
+    for name in ("Content-Length", "Content-Range", "Content-Encoding",
+                 "Content-Type", "Last-Modified"):
+        if old.headers.get(name, "") != new.headers.get(name, ""):
+            return False
+    return True
+
+
+class R2DownloadRouter:
+    def __init__(self, settings: Settings | None = None) -> None:
+        self.settings = settings or load_settings()
+        self.config = self.settings.section("r2", "download")
+        self.enabled = self.settings.section("r2")["enabled"] and self.config["enabled"]
+        self.threshold_kib_s = self.config["slow_threshold_kib_s"]
+        self.window_seconds = self.config["slow_window_seconds"]
+        self.replacement_proxy = self.config["replacement_proxy"]
+        self.max_concurrent = self.config["max_concurrent_takeovers"]
+        self._token = secrets.token_urlsafe(32)
+        self._contexts: dict[str, _RequestContext] = {}
+        self._active_takeovers = 0
+        self._port: int | None = None
+        self._runner: web.AppRunner | None = None
+        self._site: web.TCPSite | None = None
+        self._session: ClientSession | None = None
+        self._stats = {
+            "eligible_gets": 0, "slow_detected": 0, "takeover_started": 0,
+            "takeover_succeeded": 0, "takeover_failed": 0, "capacity_skipped": 0,
+        }
+        self._last_event: dict | None = None
+
+    @property
+    def status_path(self) -> Path:
+        return self.settings.runtime / "r2-download-status.json"
+
+    async def running(self) -> None:
+        if not self.enabled:
+            self._write_status()
+            return
+        try:
+            ensure_runtime(self.settings)
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
+            timeout = ClientTimeout(total=None, connect=20, sock_connect=15, sock_read=None)
+            connector = TCPConnector(ssl=ssl_context, limit=100, enable_cleanup_closed=True)
+            self._session = ClientSession(
+                connector=connector,
+                timeout=timeout,
+                auto_decompress=False,
+                trust_env=False,
+                skip_auto_headers={"Accept", "Accept-Encoding", "User-Agent"},
+            )
+            app = web.Application(client_max_size=0)
+            app.router.add_get("/{request_id}", self._relay)
+            self._runner = web.AppRunner(app, access_log=None)
+            await self._runner.setup()
+            self._site = web.TCPSite(self._runner, "127.0.0.1", 0)
+            await self._site.start()
+            sockets = self._site._server.sockets if self._site._server else []
+            if not sockets:
+                raise RuntimeError("local R2 download relay did not bind")
+            self._port = int(sockets[0].getsockname()[1])
+            self._write_status()
+            LOG.info("R2 download relay ready on loopback, port=%s", self._port)
+        except Exception as exc:
+            self._port = None
+            if self._runner:
+                await self._runner.cleanup()
+                self._runner = None
+            if self._session:
+                await self._session.close()
+                self._session = None
+            LOG.error("R2 download relay unavailable; GET passthrough remains enabled: %s",
+                      type(exc).__name__)
+            self._write_status()
+
+    def requestheaders(self, flow: http.HTTPFlow) -> None:
+        request = flow.request
+        if not self.enabled or self._port is None:
+            return
+        if not is_r2_object_get(request.method, request.host, request.url, request.headers):
+            return
+
+        request_id = secrets.token_hex(8)
+        context = _RequestContext(
+            request_id=request_id,
+            url=request.url,
+            headers=tuple(request.headers.fields),
+            client_id=getattr(flow.client_conn, "id", None),
+            range_requested=bool(request.headers.get("Range")),
+            started=asyncio.get_running_loop().time(),
+        )
+        self._contexts[request_id] = context
+        flow.metadata[_FLOW_ID] = request_id
+        self._stats["eligible_gets"] += 1
+        self._write_status()
+
+        request.scheme = "http"
+        request.host = "127.0.0.1"
+        request.port = self._port
+        request.path = f"/{request_id}"
+        request.authority = f"127.0.0.1:{self._port}"
+        request.headers.clear()
+        request.host_header = f"127.0.0.1:{self._port}"
+        request.headers[_INTERNAL_TOKEN] = self._token
+        request.headers[_INTERNAL_REQUEST] = request_id
+
+    def responseheaders(self, flow: http.HTTPFlow) -> None:
+        if flow.metadata.get(_FLOW_ID) and flow.response:
+            flow.response.stream = True
+
+    def response(self, flow: http.HTTPFlow) -> None:
+        request_id = flow.metadata.get(_FLOW_ID)
+        if request_id:
+            self._contexts.pop(request_id, None)
+
+    def error(self, flow: http.HTTPFlow) -> None:
+        request_id = flow.metadata.get(_FLOW_ID)
+        if request_id:
+            self._contexts.pop(request_id, None)
+
+    def client_disconnected(self, client) -> None:
+        client_id = getattr(client, "id", None)
+        for context in list(self._contexts.values()):
+            if context.client_id == client_id and context.task and not context.task.done():
+                context.task.cancel()
+
+    async def done(self) -> None:
+        for context in list(self._contexts.values()):
+            if context.task and not context.task.done():
+                context.task.cancel()
+        if self._runner:
+            await self._runner.cleanup()
+            self._runner = None
+        if self._session:
+            await self._session.close()
+            self._session = None
+        self._port = None
+        self._write_status()
+
+    async def _open_upstream(self, context: _RequestContext, proxy: str | None = None) -> ClientResponse:
+        if self._session is None:
+            raise RuntimeError("R2 download HTTP session is not ready")
+        return await self._session.get(
+            URL(context.url, encoded=True),
+            headers=_forward_request_headers(context.headers),
+            allow_redirects=False,
+            proxy=proxy,
+        )
+
+    async def _relay(self, request: web.Request) -> web.StreamResponse:
+        request_id = request.match_info["request_id"]
+        context = self._contexts.get(request_id)
+        supplied_token = request.headers.get(_INTERNAL_TOKEN, "")
+        if (context is None or not hmac.compare_digest(supplied_token, self._token)
+                or request.headers.get(_INTERNAL_REQUEST) != request_id):
+            raise web.HTTPNotFound()
+        context.task = asyncio.current_task()
+        initial_task: asyncio.Task | None = None
+        upstream: ClientResponse | None = None
+        downstream: web.StreamResponse | None = None
+        try:
+            started = asyncio.get_running_loop().time()
+            window = _RateWindow(started, self.window_seconds)
+            initial_task = asyncio.create_task(self._open_upstream(context))
+
+            while not initial_task.done():
+                await asyncio.wait({initial_task}, timeout=1.0)
+                now = asyncio.get_running_loop().time()
+                rate = window.sample(now)
+                if (rate is not None and rate < self.threshold_kib_s
+                        and not context.takeover_attempted):
+                    self._stats["slow_detected"] += 1
+                    self._record(context, "slow_detected", rate=rate)
+                    replacement = await self._try_takeover(context, None, rate)
+                    if replacement is not None:
+                        if not initial_task.done():
+                            initial_task.cancel()
+                        with suppress(asyncio.CancelledError, Exception):
+                            original_result = await initial_task
+                            if original_result is not replacement:
+                                original_result.close()
+                        upstream = replacement
+                        break
+
+            if upstream is None:
+                upstream = await initial_task
+
+            if not _response_is_takeover_eligible(upstream, context):
+                return await self._stream_without_takeover(request, upstream)
+
+            while True:
+                try:
+                    data = await asyncio.wait_for(upstream.content.read(_CHUNK_SIZE), timeout=1.0)
+                except asyncio.TimeoutError:
+                    data = None
+
+                now = asyncio.get_running_loop().time()
+                if data is not None:
+                    if data:
+                        window.add(now, len(data))
+                    else:
+                        if downstream is None:
+                            downstream = self._make_downstream(upstream)
+                        if not downstream.prepared:
+                            await downstream.prepare(request)
+                        await downstream.write_eof()
+                        return downstream
+
+                rate = window.sample(now)
+                if (rate is not None and rate < self.threshold_kib_s
+                        and not context.takeover_attempted):
+                    self._stats["slow_detected"] += 1
+                    self._record(context, "slow_detected", rate=rate)
+                    replacement = await self._try_takeover(context, upstream, rate)
+                    if replacement is not None:
+                        upstream.close()
+                        upstream = replacement
+                        if downstream is None or not downstream.prepared:
+                            downstream = self._make_downstream(upstream)
+                        continue
+
+                if data is None:
+                    continue
+                if downstream is None:
+                    downstream = self._make_downstream(upstream)
+                if not downstream.prepared:
+                    await downstream.prepare(request)
+                await downstream.write(data)
+                context.delivered_bytes += len(data)
+                context.delivered_hash.update(data)
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._record(context, "relay_error", reason=type(exc).__name__)
+            LOG.warning("R2 download relay failed request_id=%s reason=%s",
+                        context.request_id, type(exc).__name__)
+            if downstream is not None and downstream.prepared:
+                if request.transport:
+                    request.transport.close()
+                return downstream
+            return web.Response(status=502, text="R2 download relay failed\n")
+        finally:
+            if initial_task:
+                if not initial_task.done():
+                    initial_task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    initial_result = await initial_task
+                    if initial_result is not upstream:
+                        initial_result.close()
+            if upstream:
+                upstream.close()
+            if context.slot_reserved:
+                self._release_slot(context)
+            context.task = None
+            self._contexts.pop(request_id, None)
+            self._write_status()
+
+    def _make_downstream(self, upstream: ClientResponse) -> web.StreamResponse:
+        return web.StreamResponse(
+            status=upstream.status,
+            reason=upstream.reason,
+            headers=_response_headers(upstream),
+        )
+
+    async def _stream_without_takeover(
+        self, request: web.Request, upstream: ClientResponse
+    ) -> web.StreamResponse:
+        downstream = self._make_downstream(upstream)
+        await downstream.prepare(request)
+        async for data in upstream.content.iter_chunked(_CHUNK_SIZE):
+            await downstream.write(data)
+        await downstream.write_eof()
+        return downstream
+
+    def _reserve_slot(self, context: _RequestContext) -> bool:
+        if self._active_takeovers >= self.max_concurrent:
+            return False
+        self._active_takeovers += 1
+        context.slot_reserved = True
+        self._stats["takeover_started"] += 1
+        self._write_status()
+        return True
+
+    def _release_slot(self, context: _RequestContext) -> None:
+        if context.slot_reserved:
+            context.slot_reserved = False
+            self._active_takeovers = max(0, self._active_takeovers - 1)
+            self._write_status()
+
+    async def _try_takeover(
+        self, context: _RequestContext, original: ClientResponse | None, rate: float
+    ) -> ClientResponse | None:
+        context.takeover_attempted = True
+        if not self._reserve_slot(context):
+            self._stats["capacity_skipped"] += 1
+            self._record(context, "capacity_full", rate=rate)
+            return None
+
+        replacement: ClientResponse | None = None
+        try:
+            replacement = await asyncio.wait_for(
+                self._open_upstream(context, proxy=self.replacement_proxy),
+                timeout=_REPLACEMENT_HEADER_TIMEOUT,
+            )
+            if not _response_is_takeover_eligible(replacement, context):
+                raise ValueError("replacement_response_not_eligible")
+
+            if context.delivered_bytes:
+                if original is None or not _same_representation(original, replacement):
+                    raise ValueError("replacement_validator_mismatch")
+                digest = hashlib.sha256()
+                remaining = context.delivered_bytes
+                while remaining:
+                    piece = await asyncio.wait_for(
+                        replacement.content.read(min(_CHUNK_SIZE, remaining)),
+                        timeout=_REPLACEMENT_HEADER_TIMEOUT,
+                    )
+                    if not piece:
+                        raise ValueError("replacement_prefix_truncated")
+                    digest.update(piece)
+                    remaining -= len(piece)
+                if digest.digest() != context.delivered_hash.digest():
+                    raise ValueError("replacement_prefix_mismatch")
+
+            self._stats["takeover_succeeded"] += 1
+            self._record(context, "takeover_succeeded", rate=rate)
+            return replacement
+        except asyncio.CancelledError:
+            if replacement:
+                replacement.close()
+            self._release_slot(context)
+            raise
+        except Exception as exc:
+            if replacement:
+                replacement.close()
+            self._stats["takeover_failed"] += 1
+            self._record(context, "takeover_failed", rate=rate, reason=str(exc)[:80])
+            self._release_slot(context)
+            return None
+
+    def _record(
+        self, context: _RequestContext, result: str, rate: float | None = None,
+        reason: str | None = None,
+    ) -> None:
+        self._last_event = {
+            "request_id": context.request_id,
+            "result": result,
+            "rate_kib_s": round(rate, 2) if rate is not None else None,
+            "delivered_bytes": context.delivered_bytes,
+            "reason": reason,
+            "timestamp": time.time(),
+        }
+        self._write_status()
+
+    def _write_status(self) -> None:
+        path = self.status_path
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            path.parent.chmod(0o700)
+            payload = {
+                "enabled": self.enabled,
+                "relay_ready": self._port is not None,
+                "active_takeovers": self._active_takeovers,
+                "max_concurrent_takeovers": self.max_concurrent,
+                "slow_threshold_kib_s": self.threshold_kib_s,
+                "slow_window_seconds": self.window_seconds,
+                **self._stats,
+                "last_event": self._last_event,
+            }
+            temp = path.with_name(path.name + ".tmp")
+            fd = os.open(temp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    json.dump(payload, stream, ensure_ascii=False)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temp, path)
+            finally:
+                temp.unlink(missing_ok=True)
+        except OSError:
+            LOG.warning("Unable to update private R2 download status")

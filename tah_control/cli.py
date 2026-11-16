@@ -76,7 +76,6 @@ def main(argv=None) -> int:
             print("Supervisor requested to " + ("restart IOTA" if action == "restart" else "run"))
             return 0
         if action == "reload":
-            # load_settings has already validated the requested config.
             macos.kickstart(restart=True)
             print("Supervisor reload requested; managed app and proxy will restart")
             return 0
@@ -93,6 +92,12 @@ def main(argv=None) -> int:
             path = settings.runtime / "status.json"
             record = json.loads(path.read_text()) if path.is_file() else {}
             record["configured_desired"] = desired(settings)
+            download_path = settings.runtime / "r2-download-status.json"
+            if download_path.is_file():
+                try:
+                    record["r2_download"] = json.loads(download_path.read_text())
+                except (OSError, ValueError):
+                    record["r2_download"] = {"status": "unavailable"}
             pid = record.get("supervisor_pid")
             if isinstance(pid, int):
                 try:

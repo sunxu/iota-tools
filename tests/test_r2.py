@@ -5,7 +5,7 @@ import unittest
 
 from mitmproxy.connection import Server
 from r2_client.eligibility import is_upload_part
-from r2_client.addon import R2UploadRouter
+from r2_client.upload import R2UploadRouter
 from tah_control.config import load_settings
 
 HOST = "bucket.r2.cloudflarestorage.com"

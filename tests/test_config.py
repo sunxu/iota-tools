@@ -11,6 +11,8 @@ class SettingsTests(unittest.TestCase):
             settings = load_settings(Path(tmp) / "missing.toml")
         self.assertEqual(settings.section("proxy")["port"], 8899)
         self.assertEqual(settings.section("r2", "upload")["max_concurrency"], 5)
+        self.assertEqual(settings.section("r2", "download")["max_concurrent_takeovers"], 8)
+        self.assertEqual(settings.section("r2", "download")["slow_threshold_kib_s"], 500)
 
     def test_override_and_unknown_key(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -20,6 +22,23 @@ class SettingsTests(unittest.TestCase):
             p.write_text("[r2.upload]\nnot_a_real_field=4\n")
             with self.assertRaisesRegex(ValueError, "unknown"):
                 load_settings(p)
+
+    def test_download_override_and_bounds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "local.toml"
+            p.write_text('[r2.download]\nmax_concurrent_takeovers=12\nreplacement_proxy="http://127.0.0.1:7894"\n')
+            settings = load_settings(p)
+            self.assertEqual(settings.section("r2", "download")["max_concurrent_takeovers"], 12)
+            self.assertEqual(settings.section("r2", "download")["replacement_proxy"], "http://127.0.0.1:7894")
+            for invalid in (
+                "[r2.download]\nmax_concurrent_takeovers=0\n",
+                "[r2.download]\nmax_concurrent_takeovers=65\n",
+                "[r2.download]\nslow_threshold_kib_s=0\n",
+                '[r2.download]\nreplacement_proxy="http://10.0.0.1:7893"\n',
+            ):
+                p.write_text(invalid)
+                with self.assertRaises(ValueError):
+                    load_settings(p)
 
     def test_schema_and_ranges(self):
         with tempfile.TemporaryDirectory() as tmp:

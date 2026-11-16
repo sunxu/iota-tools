@@ -24,7 +24,6 @@ def _merge(base: dict, override: dict, prefix: str = "") -> None:
                 raise ValueError(f"{where} must be a section")
             _merge(original, value, where + ".")
         elif type(original) is not type(value):
-            # bool is not interchangeable with an integer
             if not (type(original) is int and type(value) is float):
                 raise ValueError(f"wrong type for {where}")
             base[key] = value
@@ -94,6 +93,20 @@ class Settings:
         for name in ("probe_interval_seconds", "probe_timeout_seconds"):
             if type(up[name]) not in (int, float) or up[name] <= 0:
                 raise ValueError(f"r2.upload.{name} must be positive")
+
+        down = d["r2"]["download"]
+        if type(down["enabled"]) is not bool:
+            raise ValueError("r2.download.enabled must be boolean")
+        if (type(down["slow_threshold_kib_s"]) is not int
+                or not 1 <= down["slow_threshold_kib_s"] <= 100000):
+            raise ValueError("r2.download.slow_threshold_kib_s out of range")
+        if (type(down["slow_window_seconds"]) is not int
+                or not 1 <= down["slow_window_seconds"] <= 120):
+            raise ValueError("r2.download.slow_window_seconds out of range")
+        _proxy_url(down["replacement_proxy"], "r2.download.replacement_proxy")
+        if (type(down["max_concurrent_takeovers"]) is not int
+                or not 1 <= down["max_concurrent_takeovers"] <= 64):
+            raise ValueError("r2.download.max_concurrent_takeovers must be between 1 and 64")
         if not self.app.is_absolute():
             raise ValueError("app.path must be absolute")
 
