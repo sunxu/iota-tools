@@ -709,6 +709,7 @@ class R2DownloadRouter:
                 json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
             ).encode("utf-8")
             fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            os.fchmod(fd, 0o600)
             with os.fdopen(fd, "ab") as stream:
                 stream.write(encoded)
                 stream.flush()
@@ -719,6 +720,7 @@ class R2DownloadRouter:
             if len(lines) > _EVENT_HISTORY_LIMIT:
                 temp = path.with_name(path.name + ".tmp")
                 fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                os.fchmod(fd, 0o600)
                 with os.fdopen(fd, "wb") as stream:
                     stream.write(b"".join(lines[-_EVENT_HISTORY_LIMIT:]))
                     stream.flush()
