@@ -264,7 +264,7 @@ class DownloadRouterUnitTests(unittest.IsolatedAsyncioTestCase):
 
         path = self.router.event_history_path
         path.write_text(
-            "".join(json.dumps({"result": f"test_event_{index}"}) + "\\n"
+            "".join(json.dumps({"result": f"test_event_{index}"}) + "\n"
                     for index in range(1000)),
             encoding="utf-8",
         )
