@@ -11,7 +11,7 @@ class SettingsTests(unittest.TestCase):
             settings = load_settings(Path(tmp) / "missing.toml")
         self.assertEqual(settings.section("proxy")["port"], 8899)
         self.assertEqual(settings.section("r2", "upload")["max_concurrency"], 5)
-        self.assertEqual(settings.section("r2", "download")["max_concurrent_takeovers"], 8)
+        self.assertEqual(settings.section("r2", "download")["max_concurrent_takeovers"], 16)
         self.assertEqual(settings.section("r2", "download")["slow_threshold_kib_s"], 500)
 
     def test_override_and_unknown_key(self):
