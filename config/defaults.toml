@@ -35,7 +35,7 @@ enabled = true
 slow_threshold_kib_s = 500
 slow_window_seconds = 10
 replacement_proxy = "http://127.0.0.1:7893"
-max_concurrent_takeovers = 8
+max_concurrent_takeovers = 16
 
 [certificates]
 relay_root_ca = "~/r2-relay-root.crt"
