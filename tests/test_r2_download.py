@@ -139,10 +139,13 @@ class DownloadRouterUnitTests(unittest.IsolatedAsyncioTestCase):
             )
             await response.prepare(request)
             slow_started.set()
-            for offset in range(0, len(body), 512):
-                await response.write(body[offset:offset + 512])
-                await asyncio.sleep(0.2)
-            await response.write_eof()
+            try:
+                for offset in range(0, len(body), 512):
+                    await response.write(body[offset:offset + 512])
+                    await asyncio.sleep(0.2)
+                await response.write_eof()
+            except ConnectionResetError:
+                pass
             return response
 
         async def replacement_proxy(request):

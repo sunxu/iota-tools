@@ -174,6 +174,9 @@ class R2DownloadRouter:
         try:
             ensure_runtime(self.settings)
             ssl_context = ssl.create_default_context(cafile=certifi.where())
+            extra_ca = os.environ.get("IOTA_R2_UPSTREAM_CA")
+            if extra_ca:
+                ssl_context.load_verify_locations(cafile=extra_ca)
             timeout = ClientTimeout(total=None, connect=20, sock_connect=15, sock_read=None)
             connector = TCPConnector(ssl=ssl_context, limit=100, enable_cleanup_closed=True)
             self._session = ClientSession(
@@ -268,6 +271,7 @@ class R2DownloadRouter:
         if self._session:
             await self._session.close()
             self._session = None
+        self._contexts.clear()
         self._port = None
         self._write_status()
 
@@ -469,7 +473,12 @@ class R2DownloadRouter:
             if replacement:
                 replacement.close()
             self._stats["takeover_failed"] += 1
-            self._record(context, "takeover_failed", rate=rate, reason=str(exc)[:80])
+            safe_reasons = {
+                "replacement_response_not_eligible", "replacement_validator_mismatch",
+                "replacement_prefix_truncated", "replacement_prefix_mismatch",
+            }
+            reason = str(exc) if isinstance(exc, ValueError) and str(exc) in safe_reasons else type(exc).__name__
+            self._record(context, "takeover_failed", rate=rate, reason=reason)
             self._release_slot(context)
             return None
 
@@ -494,6 +503,8 @@ class R2DownloadRouter:
             path.parent.chmod(0o700)
             payload = {
                 "enabled": self.enabled,
+                "process_pid": os.getpid(),
+                "updated_at": time.time(),
                 "relay_ready": self._port is not None,
                 "active_takeovers": self._active_takeovers,
                 "max_concurrent_takeovers": self.max_concurrent,
@@ -504,6 +515,7 @@ class R2DownloadRouter:
             }
             temp = path.with_name(path.name + ".tmp")
             fd = os.open(temp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+            os.chmod(temp, 0o600)
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as stream:
                     json.dump(payload, stream, ensure_ascii=False)
