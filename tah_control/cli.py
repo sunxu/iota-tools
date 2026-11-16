@@ -95,7 +95,11 @@ def main(argv=None) -> int:
             download_path = settings.runtime / "r2-download-status.json"
             if download_path.is_file():
                 try:
-                    record["r2_download"] = json.loads(download_path.read_text())
+                    download_status = json.loads(download_path.read_text())
+                    if download_status.get("process_pid") != record.get("proxy_pid"):
+                        download_status["relay_ready"] = False
+                        download_status["status"] = "stale"
+                    record["r2_download"] = download_status
                 except (OSError, ValueError):
                     record["r2_download"] = {"status": "unavailable"}
             pid = record.get("supervisor_pid")

@@ -192,10 +192,10 @@ class R2DownloadRouter:
             await self._runner.setup()
             self._site = web.TCPSite(self._runner, "127.0.0.1", 0)
             await self._site.start()
-            sockets = self._site._server.sockets if self._site._server else []
-            if not sockets:
+            addresses = self._runner.addresses
+            if not addresses:
                 raise RuntimeError("local R2 download relay did not bind")
-            self._port = int(sockets[0].getsockname()[1])
+            self._port = int(addresses[0][1])
             self._write_status()
             LOG.info("R2 download relay ready on loopback, port=%s", self._port)
         except Exception as exc:
@@ -297,8 +297,7 @@ class R2DownloadRouter:
         upstream: ClientResponse | None = None
         downstream: web.StreamResponse | None = None
         try:
-            started = asyncio.get_running_loop().time()
-            window = _RateWindow(started, self.window_seconds)
+            window = _RateWindow(context.started, self.window_seconds)
             initial_task = asyncio.create_task(self._open_upstream(context))
 
             while not initial_task.done():
@@ -429,6 +428,8 @@ class R2DownloadRouter:
     async def _try_takeover(
         self, context: _RequestContext, original: ClientResponse | None, rate: float
     ) -> ClientResponse | None:
+        if context.takeover_attempted:
+            return None
         context.takeover_attempted = True
         if not self._reserve_slot(context):
             self._stats["capacity_skipped"] += 1
