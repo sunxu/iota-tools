@@ -1,4 +1,4 @@
-"""Slow R2 GET detection and one-shot proxy takeover.
+"""Slow R2 GET detection and capacity-aware proxy takeover.
 
 A tiny loopback HTTP relay owns the asynchronous upstream streams. mitmproxy
 rewrites eligible GETs to this relay and streams its response to the IOTA client.
@@ -36,7 +36,7 @@ _INTERNAL_REQUEST = "X-Iota-Download-Request"
 _FLOW_ID = "iota_r2_download_id"
 _CHUNK_SIZE = 64 * 1024
 _REPLACEMENT_HEADER_TIMEOUT = 20.0
-_EVENT_HISTORY_LIMIT = 100
+_EVENT_HISTORY_LIMIT = 1000
 _HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade",
@@ -62,6 +62,18 @@ class _RequestContext:
     replacement_stream_started: float | None = None
     replacement_bytes: int = 0
     replacement_stream_completed: bool = False
+    response_status: int | None = None
+    response_content_length: int | None = None
+    min_10s_window_rate_kib_s: float | None = None
+    slow_detected: bool = False
+    capacity_full_count: int = 0
+    capacity_full_event_recorded: bool = False
+    takeover_skip_reason: str | None = None
+    final_status: str = "failed"
+    summary_recorded: bool = False
+    relay_started: bool = False
+    slot_reserved_at: float | None = None
+    slot_held_ms: float | None = None
 
 
 class _RateWindow:
@@ -148,6 +160,23 @@ def _same_representation(old: ClientResponse, new: ClientResponse) -> bool:
     return True
 
 
+def _content_length(response: Any) -> int | None:
+    raw = response.headers.get("Content-Length")
+    if raw is None:
+        return None
+    try:
+        length = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return length if length >= 0 else None
+
+
+def _progress_percent(delivered_bytes: int, content_length: int | None) -> float | None:
+    if content_length is None or content_length <= 0:
+        return None
+    return min(100.0, delivered_bytes * 100.0 / content_length)
+
+
 class R2DownloadRouter:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or load_settings()
@@ -174,6 +203,8 @@ class R2DownloadRouter:
             "takeover_stream_failed": 0,
             "takeover_stream_cancelled": 0,
             "capacity_skipped": 0,
+            "takeover_slot_released": 0,
+            "download_summaries": 0,
         }
         self._last_event: dict | None = None
 
@@ -266,12 +297,33 @@ class R2DownloadRouter:
     def response(self, flow: http.HTTPFlow) -> None:
         request_id = flow.metadata.get(_FLOW_ID)
         if request_id:
-            self._contexts.pop(request_id, None)
+            self._finalize_unstarted_context(
+                request_id, "completed", "RELAY_NOT_STARTED", flow.response
+            )
 
     def error(self, flow: http.HTTPFlow) -> None:
         request_id = flow.metadata.get(_FLOW_ID)
         if request_id:
-            self._contexts.pop(request_id, None)
+            self._finalize_unstarted_context(request_id, "failed", "RELAY_ERROR")
+
+    def _finalize_unstarted_context(
+        self,
+        request_id: str,
+        final_status: str,
+        reason: str,
+        response: Any | None = None,
+    ) -> None:
+        context = self._contexts.get(request_id)
+        if context is None or context.relay_started:
+            return
+        self._contexts.pop(request_id, None)
+        context.final_status = final_status
+        context.takeover_skip_reason = context.takeover_skip_reason or reason
+        if response is not None:
+            context.response_status = getattr(response, "status_code", None)
+            context.response_content_length = _content_length(response)
+        self._record_download_summary(context)
+        self._write_status()
 
     def client_disconnected(self, client) -> None:
         client_id = getattr(client, "id", None)
@@ -289,6 +341,11 @@ class R2DownloadRouter:
         if self._session:
             await self._session.close()
             self._session = None
+        for context in list(self._contexts.values()):
+            if not context.summary_recorded:
+                context.final_status = "cancelled"
+                context.takeover_skip_reason = context.takeover_skip_reason or "REQUEST_CANCELLED"
+                self._record_download_summary(context)
         self._contexts.clear()
         self._port = None
         self._write_status()
@@ -311,6 +368,7 @@ class R2DownloadRouter:
                 or request.headers.get(_INTERNAL_REQUEST) != request_id):
             raise web.HTTPNotFound()
         context.task = asyncio.current_task()
+        context.relay_started = True
         initial_task: asyncio.Task | None = None
         upstream: ClientResponse | None = None
         downstream: web.StreamResponse | None = None
@@ -322,11 +380,11 @@ class R2DownloadRouter:
                 await asyncio.wait({initial_task}, timeout=1.0)
                 now = asyncio.get_running_loop().time()
                 rate = window.sample(now)
+                self._observe_rate(context, rate)
                 if (rate is not None and rate < self.threshold_kib_s
-                        and not context.takeover_attempted):
-                    self._stats["slow_detected"] += 1
-                    self._record(context, "slow_detected", rate=rate, stage="slow_window")
-                    replacement = await self._try_takeover(context, None, rate)
+                        and not context.takeover_attempted
+                        and context.takeover_skip_reason is None):
+                    replacement = await self._consider_takeover(context, None, rate)
                     if replacement is not None:
                         if not initial_task.done():
                             initial_task.cancel()
@@ -340,8 +398,10 @@ class R2DownloadRouter:
             if upstream is None:
                 upstream = await initial_task
 
+            self._set_response_metadata(context, upstream)
             if not _response_is_takeover_eligible(upstream, context):
-                return await self._stream_without_takeover(request, upstream)
+                context.takeover_skip_reason = "RESPONSE_NOT_ELIGIBLE"
+                return await self._stream_without_takeover(request, upstream, context)
 
             while True:
                 try:
@@ -362,17 +422,19 @@ class R2DownloadRouter:
                         if (context.replacement_stream_started is not None
                                 and not context.replacement_stream_completed):
                             self._complete_replacement(context)
+                        context.final_status = "completed"
                         return downstream
 
                 rate = window.sample(now)
+                self._observe_rate(context, rate)
                 if (rate is not None and rate < self.threshold_kib_s
-                        and not context.takeover_attempted):
-                    self._stats["slow_detected"] += 1
-                    self._record(context, "slow_detected", rate=rate, stage="slow_window")
-                    replacement = await self._try_takeover(context, upstream, rate)
+                        and not context.takeover_attempted
+                        and context.takeover_skip_reason is None):
+                    replacement = await self._consider_takeover(context, upstream, rate)
                     if replacement is not None:
                         upstream.close()
                         upstream = replacement
+                        self._set_response_metadata(context, upstream)
                         if downstream is None or not downstream.prepared:
                             downstream = self._make_downstream(upstream)
                         continue
@@ -390,6 +452,7 @@ class R2DownloadRouter:
                     context.replacement_bytes += len(data)
 
         except asyncio.CancelledError:
+            context.final_status = "cancelled"
             if (context.replacement_stream_started is not None
                     and not context.replacement_stream_completed):
                 self._stats["takeover_stream_cancelled"] += 1
@@ -403,6 +466,7 @@ class R2DownloadRouter:
                 )
             raise
         except Exception as exc:
+            context.final_status = "failed"
             if (context.replacement_stream_started is not None
                     and not context.replacement_stream_completed):
                 self._stats["takeover_stream_failed"] += 1
@@ -447,10 +511,10 @@ class R2DownloadRouter:
                         initial_result.close()
             if upstream:
                 upstream.close()
-            if context.slot_reserved:
-                self._release_slot(context)
+            self._release_slot(context)
             context.task = None
             self._contexts.pop(request_id, None)
+            self._record_download_summary(context)
             self._write_status()
 
     def _make_downstream(self, upstream: ClientResponse) -> web.StreamResponse:
@@ -461,41 +525,176 @@ class R2DownloadRouter:
         )
 
     async def _stream_without_takeover(
-        self, request: web.Request, upstream: ClientResponse
+        self, request: web.Request, upstream: ClientResponse, context: _RequestContext
     ) -> web.StreamResponse:
         downstream = self._make_downstream(upstream)
         await downstream.prepare(request)
         async for data in upstream.content.iter_chunked(_CHUNK_SIZE):
             await downstream.write(data)
+            context.delivered_bytes += len(data)
         await downstream.write_eof()
+        context.final_status = "completed"
         return downstream
 
     def _reserve_slot(self, context: _RequestContext) -> bool:
+        if context.slot_reserved:
+            return True
         if self._active_takeovers >= self.max_concurrent:
             return False
         self._active_takeovers += 1
         context.slot_reserved = True
+        context.slot_reserved_at = asyncio.get_running_loop().time()
         self._stats["takeover_started"] += 1
         self._write_status()
         return True
 
     def _release_slot(self, context: _RequestContext) -> None:
-        if context.slot_reserved:
-            context.slot_reserved = False
-            self._active_takeovers = max(0, self._active_takeovers - 1)
-            self._write_status()
+        if not context.slot_reserved:
+            return
+        now = asyncio.get_running_loop().time()
+        if context.slot_reserved_at is not None:
+            context.slot_held_ms = round(max(0.0, now - context.slot_reserved_at) * 1000, 2)
+        context.slot_reserved = False
+        context.slot_reserved_at = None
+        self._active_takeovers = max(0, self._active_takeovers - 1)
+        self._stats["takeover_slot_released"] += 1
+        self._write_status()
+
+    def _observe_rate(self, context: _RequestContext, rate: float | None) -> None:
+        if rate is None:
+            return
+        current = context.min_10s_window_rate_kib_s
+        if current is None or rate < current:
+            context.min_10s_window_rate_kib_s = round(rate, 2)
+
+    def _set_response_metadata(
+        self, context: _RequestContext, response: ClientResponse
+    ) -> None:
+        context.response_status = response.status
+        context.response_content_length = _content_length(response)
+
+    async def _consider_takeover(
+        self, context: _RequestContext, original: ClientResponse | None, rate: float
+    ) -> ClientResponse | None:
+        if not context.slow_detected:
+            context.slow_detected = True
+            self._stats["slow_detected"] += 1
+            self._record(context, "slow_detected", rate=rate, stage="slow_window")
+
+        progress = _progress_percent(
+            context.delivered_bytes, context.response_content_length
+        )
+        if progress is not None and progress >= 70.0:
+            context.takeover_skip_reason = "DOWNLOAD_70_PERCENT_REACHED"
+            self._record(
+                context,
+                "takeover_skipped",
+                rate=rate,
+                reason=context.takeover_skip_reason,
+                stage="progress_limit",
+                extra_fields={"progress_percent": round(progress, 2)},
+            )
+            return None
+        return await self._try_takeover(context, original, rate)
+
+    def _record_download_summary(self, context: _RequestContext) -> None:
+        if context.summary_recorded:
+            return
+        context.summary_recorded = True
+
+        loop = asyncio.get_running_loop()
+        duration_ms = round(max(0.0, loop.time() - context.started) * 1000, 2)
+        progress = _progress_percent(
+            context.delivered_bytes, context.response_content_length
+        )
+
+        if context.replacement_stream_completed:
+            takeover_result = "completed"
+        elif context.replacement_stream_started is not None:
+            if context.final_status == "cancelled":
+                takeover_result = "cancelled"
+            elif context.final_status == "failed":
+                takeover_result = "stream_failed"
+            else:
+                takeover_result = "succeeded"
+        elif context.takeover_attempted:
+            takeover_result = "failed"
+        elif context.capacity_full_count:
+            takeover_result = "not_attempted_capacity_full"
+        else:
+            takeover_result = "not_attempted"
+
+        if context.final_status == "cancelled":
+            skip_reason = "REQUEST_CANCELLED"
+        elif context.final_status == "failed":
+            if (context.replacement_stream_started is not None
+                    and not context.replacement_stream_completed):
+                skip_reason = "REPLACEMENT_STREAM_FAILED"
+            elif context.takeover_attempted and context.replacement_stream_started is None:
+                skip_reason = "TAKEOVER_FAILED"
+            else:
+                skip_reason = "RELAY_FAILED"
+        elif context.replacement_stream_completed:
+            skip_reason = None
+        elif context.takeover_skip_reason:
+            skip_reason = context.takeover_skip_reason
+        elif context.takeover_attempted:
+            skip_reason = "TAKEOVER_FAILED"
+        elif context.capacity_full_count:
+            skip_reason = "CAPACITY_FULL"
+        elif not context.slow_detected:
+            skip_reason = (
+                "INSUFFICIENT_DURATION"
+                if duration_ms < self.window_seconds * 1000
+                else "THRESHOLD_NOT_REACHED"
+            )
+        else:
+            skip_reason = "TAKEOVER_NOT_PERFORMED"
+
+        self._stats["download_summaries"] += 1
+        self._record(
+            context,
+            "download_summary",
+            reason=skip_reason,
+            stage="final",
+            extra_fields={
+                "final_status": context.final_status,
+                "response_status": context.response_status,
+                "response_content_length": context.response_content_length,
+                "duration_ms": duration_ms,
+                "progress_percent": round(progress, 2) if progress is not None else None,
+                "progress_unknown": progress is None,
+                "min_10s_window_rate_kib_s": context.min_10s_window_rate_kib_s,
+                "slow_detected": context.slow_detected,
+                "capacity_full_count": context.capacity_full_count,
+                "takeover_attempted": context.takeover_attempted,
+                "takeover_result": takeover_result,
+                "skip_reason": skip_reason,
+                "slot_held_ms": context.slot_held_ms,
+                "slow_threshold_kib_s": self.threshold_kib_s,
+                "slow_window_seconds": self.window_seconds,
+            },
+        )
 
     async def _try_takeover(
         self, context: _RequestContext, original: ClientResponse | None, rate: float
     ) -> ClientResponse | None:
         if context.takeover_attempted:
             return None
-        context.takeover_attempted = True
         if not self._reserve_slot(context):
+            context.capacity_full_count += 1
             self._stats["capacity_skipped"] += 1
-            self._record(context, "capacity_full", rate=rate, stage="capacity_check")
+            if not context.capacity_full_event_recorded:
+                context.capacity_full_event_recorded = True
+                self._record(
+                    context, "capacity_full", rate=rate, stage="capacity_check",
+                    extra_fields={"capacity_full_count": context.capacity_full_count},
+                )
+            else:
+                self._write_status()
             return None
 
+        context.takeover_attempted = True
         self._record(context, "takeover_started", rate=rate, stage="replacement_open")
         replacement: ClientResponse | None = None
         stage = "replacement_open"
@@ -666,6 +865,7 @@ class R2DownloadRouter:
         replacement_bytes: int | None = None,
         replacement_elapsed_ms: float | None = None,
         replacement_avg_kib_s: float | None = None,
+        extra_fields: dict[str, Any] | None = None,
     ) -> None:
         event: dict[str, Any] = {
             "schema": "iota_r2_download_event_v1",
@@ -696,6 +896,8 @@ class R2DownloadRouter:
             "replacement_avg_kib_s": replacement_avg_kib_s,
         }
         event.update({key: value for key, value in optional_fields.items() if value is not None})
+        if extra_fields:
+            event.update(extra_fields)
         self._last_event = event
         self._append_event_history(event)
         self._write_status()
