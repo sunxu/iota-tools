@@ -39,6 +39,14 @@ mitmproxy 11.0.2 的响应流回调是同步函数。它适合对单个 chunk �
 
 通过后丢弃替换响应的前缀，只继续发送未交付的字节。失败时不拼接；原连接仍可用则继续原连接，否则结束为不完整响应。无强 ETag 的已开始响应不做中途接管。
 
+## 临时请求采集（默认开启）
+
+- `[r2.download] capture_requests = true`：下载 Relay 已就绪且请求符合 R2 GET 入口规则时，`requestheaders` 每个下载入口只写入一次；与是否触发24 MiB接管或慢速接管无关。
+- 独立私有 `r2-download-requests.jsonl` 记录 `schema=iota_r2_download_request_v1`、timestamp、request_id、method、完整原始 URL、按原始顺序保存的 Latin-1 可逆请求头二元数组，以及配置的 replacement_proxy。原始请求与替代请求仍复用同一个 context；普通事件仅通过 request_id 关联结果。
+- 主文件严格不超过 10 MiB（包括每行结尾换行），超限时将旧主文件轮转至 `r2-download-requests.jsonl.1` 并覆盖旧 `.1`；单条大于上限直接跳过。目录权限 0700，两个文件 0600；仅进行追加写，不逐条 fsync，异常退出可能丢失末尾记录或出现不完整末行。
+- 采集写入失败不影响 GET，控制台只发固定脱敏告警。普通事件、状态文件和控制台不包含请求 URL、Authorization、Cookie 等。
+- **临时敏感凭证例外**：签名 URL 与 Authorization/Cookie 应视为有效访问凭证。定位结束后将 `capture_requests = false` 并人工清理主文件及 `.1`；关闭后历史文件不会自动删除，切勿提交、共享或公开备份。
+
 ## 运维和隐私
 
 - 内部 relay 仅绑定 127.0.0.1 的动态端口，不增加独立 Supervisor 子进程。
@@ -49,5 +57,5 @@ mitmproxy 11.0.2 的响应流回调是同步函数。它适合对单个 chunk �
 - 事件记录接管阶段、异常类型、替代响应建立耗时、前缀校验耗时/字节数，以及接管后交付字节数、耗时和平均 KiB/s。接管及下载汇总记录 trigger=file_size/slow_speed 与 capacity_bypassed；不含签名 URL。
 - `takeover_failed` 表示切换前失败；`takeover_stream_failed` 表示切换成功后传输中断；客户端取消单独记为 `takeover_stream_cancelled`。
 - 替代正文连续 30 秒无数据时记录 `takeover_stream_stalled` / `REPLACEMENT_STREAM_STALLED`：下游尚未收到响应头则返回 502；已开始响应则关闭连接，留下明确的不完整响应；两种情况都释放并发名额且不回退原始连接。
-- 不记录原始 URL、签名查询参数、认证请求头、Cookie、异常原始消息或响应正文；失败原因只记录固定校验原因或异常类型。
+- 普通事件、状态和控制台不记录原始 URL、签名查询参数、认证请求头、Cookie、异常原始消息或响应正文；唯一例外是上述明确开启的独立私有请求采集文件。失败原因只记录固定校验原因或异常类型。
 - 真实 Mac / IOTA / R2 验收仍是发布前置条件。

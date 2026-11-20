@@ -15,6 +15,7 @@ from r2_client.download import (
     R2DownloadRouter,
     _RateWindow,
     _REPLACEMENT_STREAM_STALL_TIMEOUT,
+    _REQUEST_CAPTURE_MAX_BYTES,
     _RequestContext,
     _same_representation,
     _same_unstarted_representation,
@@ -352,6 +353,154 @@ class DownloadRouterUnitTests(unittest.IsolatedAsyncioTestCase):
             stall_release.set()
             await slow_runner.cleanup()
             await proxy_runner.cleanup()
+
+    def _request_capture_context(self, request_id: str) -> _RequestContext:
+        return _RequestContext(
+            request_id,
+            f"https://{HOST}/object?X-Amz-Signature=fake-only",
+            ((b"Authorization", b"Bearer fake-only"), (b"X-Raw", b"\xff\x00")),
+            "capture-test", False, asyncio.get_running_loop().time(),
+        )
+
+    async def test_request_capture_default_is_enabled_and_keeps_original_bytes(self):
+        self.assertTrue(self.router.capture_requests)
+        url = f"https://{HOST}/object?X-Amz-Signature=synthetic-secret"
+        request = http.Request.make(
+            "GET", url,
+            headers={
+                "Authorization": "Bearer synthetic-secret",
+                "Cookie": "session=synthetic-cookie",
+                "X-Order": "one",
+            },
+        )
+        request.headers.add("X-Order", "two")
+        request.headers.add("X-Latin1", "\xff")
+        original_url = request.url
+        raw_headers = tuple(request.headers.fields)
+        flow = SimpleNamespace(
+            request=request, client_conn=SimpleNamespace(id="client-capture"),
+            metadata={},
+        )
+        self.router.requestheaders(flow)
+        request_id = flow.metadata["iota_r2_download_id"]
+        context = self.router._contexts[request_id]
+        self.assertEqual(context.url, original_url)
+        self.assertEqual(context.headers, raw_headers)
+        self.assertEqual(request.host, "127.0.0.1")
+        self.router.requestheaders(flow)  # Do not duplicate this download entry.
+        path = self.router.request_capture_path
+        lines = path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 1)
+        entry = json.loads(lines[0])
+        self.assertEqual(set(entry), {
+            "schema", "timestamp", "request_id", "method", "url",
+            "headers", "replacement_proxy",
+        })
+        self.assertEqual(entry["schema"], "iota_r2_download_request_v1")
+        self.assertEqual(entry["request_id"], request_id)
+        self.assertEqual(entry["method"], "GET")
+        self.assertEqual(entry["url"], original_url)
+        self.assertEqual(entry["replacement_proxy"], self.router.replacement_proxy)
+        recovered = tuple(
+            (key.encode("latin-1"), value.encode("latin-1"))
+            for key, value in entry["headers"]
+        )
+        self.assertEqual(recovered, raw_headers)
+        self.assertEqual(sum(name == b"X-Order" for name, _ in recovered), 2)
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
+
+        self.router._record(context, "test_event")
+        ordinary = (
+            self.router.event_history_path.read_text()
+            + self.router.status_path.read_text()
+        )
+        self.assertNotIn("synthetic-secret", ordinary)
+        self.assertNotIn("synthetic-cookie", ordinary)
+        self.assertNotIn("X-Amz-Signature", ordinary)
+        self.assertIn("synthetic-secret", lines[0])
+
+    async def test_request_capture_rejects_noneligible_or_unready_entry(self):
+        request = http.Request.make("GET", f"https://{HOST}/object")
+        flow = SimpleNamespace(
+            request=request, client_conn=SimpleNamespace(id="client"),
+            metadata={},
+        )
+        saved_port = self.router._port
+        self.router._port = None
+        self.router.requestheaders(flow)
+        self.router._port = saved_port
+        self.assertFalse(self.router.request_capture_path.exists())
+        flow.request = http.Request.make("HEAD", f"https://{HOST}/object")
+        self.router.requestheaders(flow)
+        self.assertFalse(self.router.request_capture_path.exists())
+
+    async def test_request_capture_can_be_disabled_without_affecting_download(self):
+        self.router.capture_requests = False
+        flow = SimpleNamespace(
+            request=http.Request.make("GET", f"https://{HOST}/object"),
+            client_conn=SimpleNamespace(id="client"),
+            metadata={},
+        )
+        self.router.requestheaders(flow)
+        self.assertIn("iota_r2_download_id", flow.metadata)
+        self.assertEqual(flow.request.host, "127.0.0.1")
+        self.assertFalse(self.router.request_capture_path.exists())
+
+    async def test_request_capture_rotates_once_and_skips_oversized_line(self):
+        self.assertEqual(_REQUEST_CAPTURE_MAX_BYTES, 10 * 1024 * 1024)
+        path = self.router.request_capture_path
+        contexts = [self._request_capture_context(n) for n in ("aa", "bb", "cc")]
+        self.router._capture_request(contexts[0], "GET")
+        first_size = path.stat().st_size
+        self.assertGreater(first_size, 0)
+        with patch("r2_client.download._REQUEST_CAPTURE_MAX_BYTES", first_size + 32):
+            self.router._capture_request(contexts[1], "GET")
+            self.assertEqual(json.loads(path.read_text())["request_id"], "bb")
+            backup = path.with_name(path.name + ".1")
+            self.assertEqual(json.loads(backup.read_text())["request_id"], "aa")
+            self.router._capture_request(contexts[2], "GET")
+            self.assertEqual(json.loads(path.read_text())["request_id"], "cc")
+            self.assertEqual(json.loads(backup.read_text())["request_id"], "bb")
+            self.assertLessEqual(path.stat().st_size, first_size + 32)
+            self.assertLessEqual(backup.stat().st_size, first_size + 32)
+            self.assertEqual(stat.S_IMODE(backup.stat().st_mode), 0o600)
+        contents = path.read_bytes()
+        with patch("r2_client.download._REQUEST_CAPTURE_MAX_BYTES", first_size - 1):
+            self.router._capture_request(contexts[0], "GET")
+        self.assertEqual(path.read_bytes(), contents)
+
+    async def test_request_capture_failed_write_is_sanitized_and_nonfatal(self):
+        blocker = Path(self._runtime_tmp.name) / "blocking-file"
+        blocker.write_text("not a directory")
+        original_path = type(self.router).request_capture_path
+        flow = SimpleNamespace(
+            request=http.Request.make(
+                "GET", f"https://{HOST}/object?X-Amz-Signature=fake-private-token",
+                headers={"Authorization": "Bearer fake-private-token"},
+            ),
+            client_conn=SimpleNamespace(id="client"),
+            metadata={},
+        )
+        with patch.object(
+            type(self.router), "request_capture_path",
+            new_callable=PropertyMock, return_value=blocker / "requests.jsonl",
+        ):
+            with self.assertLogs("iota.r2.download", level="WARNING") as warnings:
+                self.router.requestheaders(flow)
+        self.assertIn("iota_r2_download_id", flow.metadata)
+        self.assertEqual(flow.request.host, "127.0.0.1")
+        self.assertEqual(len(warnings.output), 1)
+        self.assertIn("Unable to update private R2 download request history", warnings.output[0])
+        self.assertNotIn("fake-private-token", warnings.output[0])
+        self.assertNotIn("Authorization", warnings.output[0])
+        self.assertIsInstance(original_path, property)
+
+    async def test_request_capture_does_not_fsync(self):
+        with patch("r2_client.download.os.fsync") as fsync:
+            self.router._capture_request(self._request_capture_context("fsync"), "GET")
+        fsync.assert_not_called()
+        self.assertTrue(self.router.request_capture_path.exists())
 
     async def test_request_is_rewritten_to_private_loopback_relay(self):
         request = http.Request.make("GET", f"https://{HOST}/object?X-Amz-Signature=private",

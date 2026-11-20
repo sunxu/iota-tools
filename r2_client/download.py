@@ -38,6 +38,7 @@ _CHUNK_SIZE = 64 * 1024
 _REPLACEMENT_HEADER_TIMEOUT = 20.0
 _REPLACEMENT_STREAM_STALL_TIMEOUT = 30.0
 _EVENT_HISTORY_LIMIT = 1000
+_REQUEST_CAPTURE_MAX_BYTES = 10 * 1024 * 1024
 _HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade",
@@ -205,6 +206,7 @@ class R2DownloadRouter:
         self.settings = settings or load_settings()
         self.config = self.settings.section("r2", "download")
         self.enabled = self.settings.section("r2")["enabled"] and self.config["enabled"]
+        self.capture_requests = self.config["capture_requests"]
         self.threshold_kib_s = self.config["slow_threshold_kib_s"]
         self.window_seconds = self.config["slow_window_seconds"]
         self.replacement_proxy = self.config["replacement_proxy"]
@@ -245,6 +247,53 @@ class R2DownloadRouter:
     @property
     def event_history_path(self) -> Path:
         return self.settings.runtime / "r2-download-events.jsonl"
+
+    @property
+    def request_capture_path(self) -> Path:
+        return self.settings.runtime / "r2-download-requests.jsonl"
+
+    def _capture_request(self, context: _RequestContext, method: str) -> None:
+        """Best-effort private credential-bearing log, separate from ordinary events."""
+        if not self.capture_requests:
+            return
+        try:
+            entry = {
+                "schema": "iota_r2_download_request_v1",
+                "timestamp": time.time(),
+                "request_id": context.request_id,
+                "method": method,
+                "url": context.url,
+                "headers": [
+                    [name.decode("latin-1"), value.decode("latin-1")]
+                    for name, value in context.headers
+                ],
+                "replacement_proxy": self.replacement_proxy,
+            }
+            encoded = (
+                json.dumps(entry, ensure_ascii=True, separators=(",", ":")) + "\n"
+            ).encode("utf-8")
+            if len(encoded) > _REQUEST_CAPTURE_MAX_BYTES:
+                return
+
+            path = self.request_capture_path
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            path.parent.chmod(0o700)
+            if path.exists():
+                path.chmod(0o600)
+                if path.stat().st_size + len(encoded) > _REQUEST_CAPTURE_MAX_BYTES:
+                    os.replace(path, path.with_name(path.name + ".1"))
+
+            fd = os.open(
+                path,
+                os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "ab") as stream:
+                stream.write(encoded)
+            # Intentionally no per-record fsync: crash may lose the tail.
+        except Exception:
+            LOG.warning("Unable to update private R2 download request history")
 
     async def running(self) -> None:
         if not self.enabled:
@@ -293,6 +342,8 @@ class R2DownloadRouter:
         request = flow.request
         if not self.enabled or self._port is None:
             return
+        if flow.metadata.get(_FLOW_ID):
+            return
         if not is_r2_object_get(request.method, request.host, request.url, request.headers):
             return
 
@@ -308,6 +359,7 @@ class R2DownloadRouter:
         self._contexts[request_id] = context
         flow.metadata[_FLOW_ID] = request_id
         self._stats["eligible_gets"] += 1
+        self._capture_request(context, request.method)
         self._write_status()
 
         request.scheme = "http"

@@ -106,6 +106,8 @@ class Settings:
         if (type(down["direct_takeover_threshold_mib"]) is not int
                 or down["direct_takeover_threshold_mib"] <= 0):
             raise ValueError("r2.download.direct_takeover_threshold_mib must be a positive integer")
+        if type(down["capture_requests"]) is not bool:
+            raise ValueError("r2.download.capture_requests must be boolean")
         _proxy_url(down["replacement_proxy"], "r2.download.replacement_proxy")
         if (type(down["max_concurrent_takeovers"]) is not int
                 or not 1 <= down["max_concurrent_takeovers"] <= 64):

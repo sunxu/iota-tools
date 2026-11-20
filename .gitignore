@@ -7,6 +7,7 @@ __pycache__/
 .ruff_cache/
 *.log
 *.jsonl
+r2-download-requests.jsonl*
 *.pem
 *.crt
 *.key
