@@ -13,6 +13,7 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.section("r2", "upload")["max_concurrency"], 5)
         self.assertEqual(settings.section("r2", "download")["max_concurrent_takeovers"], 16)
         self.assertEqual(settings.section("r2", "download")["slow_threshold_kib_s"], 500)
+        self.assertEqual(settings.section("r2", "download")["direct_takeover_threshold_mib"], 24)
 
     def test_override_and_unknown_key(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -30,10 +31,15 @@ class SettingsTests(unittest.TestCase):
             settings = load_settings(p)
             self.assertEqual(settings.section("r2", "download")["max_concurrent_takeovers"], 12)
             self.assertEqual(settings.section("r2", "download")["replacement_proxy"], "http://127.0.0.1:7894")
+            p.write_text("[r2.download]\ndirect_takeover_threshold_mib=32\n")
+            self.assertEqual(load_settings(p).section("r2", "download")["direct_takeover_threshold_mib"], 32)
             for invalid in (
                 "[r2.download]\nmax_concurrent_takeovers=0\n",
                 "[r2.download]\nmax_concurrent_takeovers=65\n",
                 "[r2.download]\nslow_threshold_kib_s=0\n",
+                "[r2.download]\ndirect_takeover_threshold_mib=0\n",
+                "[r2.download]\ndirect_takeover_threshold_mib=-1\n",
+                "[r2.download]\ndirect_takeover_threshold_mib=1.5\n",
                 '[r2.download]\nreplacement_proxy="http://10.0.0.1:7893"\n',
             ):
                 p.write_text(invalid)

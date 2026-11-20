@@ -103,6 +103,9 @@ class Settings:
         if (type(down["slow_window_seconds"]) is not int
                 or not 1 <= down["slow_window_seconds"] <= 120):
             raise ValueError("r2.download.slow_window_seconds out of range")
+        if (type(down["direct_takeover_threshold_mib"]) is not int
+                or down["direct_takeover_threshold_mib"] <= 0):
+            raise ValueError("r2.download.direct_takeover_threshold_mib must be a positive integer")
         _proxy_url(down["replacement_proxy"], "r2.download.replacement_proxy")
         if (type(down["max_concurrent_takeovers"]) is not int
                 or not 1 <= down["max_concurrent_takeovers"] <= 64):

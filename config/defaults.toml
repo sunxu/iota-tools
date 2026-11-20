@@ -34,6 +34,7 @@ probe_timeout_seconds = 2
 enabled = true
 slow_threshold_kib_s = 500
 slow_window_seconds = 10
+direct_takeover_threshold_mib = 24
 replacement_proxy = "http://127.0.0.1:7893"
 max_concurrent_takeovers = 16
 

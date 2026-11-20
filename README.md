@@ -9,7 +9,7 @@ macOS IOTA 工具：版本化配置、单机常驻 Supervisor、独立 Speedtest
 - `tah_control/`：用户 LaunchAgent、进程管理、更新宽限期、重启限制、私有 CA 和 Finder 启动。
 - `speedtest/`：本地 HTTP Speedtest 服务与测速列表替换。它是模拟数据，不代表真实公网性能。
 - `r2_client/upload.py`：仅处理 R2 UploadPart PUT；18585 最多五并发、满额等待、7890 备用路线、CONNECT 故障恢复探测。
-- `r2_client/download.py`：只处理 R2 对象 GET；500 KiB/s、10 秒滚动窗口，慢请求最多接管一次，固定代理重新下载并校验已交付前缀；全局并发接管默认 16。
+- `r2_client/download.py`：只处理 R2 对象 GET；响应大于 24 MiB 时直接接管（不占慢速接管名额），否则保留 500 KiB/s、10 秒滚动窗口的慢速接管；固定代理重新下载并校验已交付前缀，慢速接管并发默认 16。
 - `r2_client/addon.py`：独立注册上传和下载模块。下载中继仅在 mitmdump 进程内绑定随机 loopback 端口，不增加独立守护进程。
 - `r2-relay` 是独立的现有仓库；这里不重复实现本地 18585 或 VPS 中继。
 
@@ -55,18 +55,19 @@ max_concurrency = 3
 
 [r2.download]
 replacement_proxy = "http://127.0.0.1:7893"
+direct_takeover_threshold_mib = 24
 max_concurrent_takeovers = 16
 ```
 
-下载默认使用 500 KiB/s、10 秒滚动窗口和 16 个并发接管名额；配置可覆盖阈值、窗口、替换代理和全局接管并发（1–64）。本机配置优先于仓库默认值；若 `~/.config/iota-tools/config.toml` 已显式设置 `max_concurrent_takeovers = 8`，需将该项改为 `16`，否则仍会沿用本机覆盖值。单个 GET 最多接管一次，接管名额满时立即放弃接管、不排队。修改配置后运行 `reload`，会先校验配置、再受控重启 Supervisor、IOTA 与代理（有短暂中断）；目前不支持无中断热更新。证书凭据和热钱包密钥不放在配置库中。
+下载默认使用 500 KiB/s、10 秒滚动窗口；单次响应长度严格大于 24 MiB 时立即尝试直接接管，不占用慢速接管的 16 个默认并发名额。其他请求保留现有慢速检测与 70% 进度限制；慢速接管名额满时继续监测，名额恢复后可再次判断，不排队。单个 GET 最多发起一次实际接管尝试。配置可覆盖大小阈值、速度、窗口、替换代理和慢速接管并发（1–64）。本机配置优先于仓库默认值；若 `~/.config/iota-tools/config.toml` 已显式设置 `max_concurrent_takeovers = 8`，需将该项改为 `16` 才会应用新默认值。修改配置后运行 `reload` 会受控重启服务（存在短暂中断），并非无中断热更新。证书凭据和热钱包密钥不放在配置库中。
 
 ## R2 下载行为与安全边界
 
 仅匹配 HTTPS `*.r2.cloudflarestorage.com` 对象 GET；Bucket 列表、管理 API、多 Range 和非 R2 请求保持原路线。初始请求不使用替换代理。慢速判断以请求发起时刻为起点，首个完整 10 秒窗口形成后，每秒检查最近 10 秒上游接收量；低于 5,120,000 bytes 即低于 500 KiB/s 时触发一次接管。
 
-接管使用相同 URL 和端到端请求头（代理 hop-by-hop 头除外），不构造 Range。若已向客户端交付正文，替换响应必须具有相同强 ETag、状态、长度、Content-Range、Content-Encoding、Content-Type 和 Last-Modified，并重新读取/校验已交付前缀 SHA-256；通过后丢弃前缀，只发送剩余字节。验证失败时继续仍可用的原连接；不能继续则以不完整响应失败，绝不拼接不一致数据。若没有强 ETag 且已有正文交付，则不接管。
+接管使用相同 URL 和端到端请求头（代理 hop-by-hop 头除外），不构造 Range。大文件直接接管发生在原始响应头返回、尚未交付正文时，需要校验替代响应状态、长度、Content-Range 等元数据及已有 ETag；不一致则保留原始连接。若已向客户端交付正文，替换响应必须具有相同强 ETag、状态、长度、Content-Range、Content-Encoding、Content-Type 和 Last-Modified，并重新读取/校验已交付前缀 SHA-256；通过后丢弃前缀，只发送剩余字节。验证失败时继续仍可用的原连接；不能继续则以不完整响应失败，绝不拼接不一致数据。若没有强 ETag 且已有正文交付，则不接管。
 
-运行指标写入用户私有目录：`r2-download-status.json` 保存当前进程汇总，`r2-download-events.jsonl` 持久保存最近 100 个接管事件。事件区分接管前失败、切换成功、完整传输完成和切换后传输中断，并记录接管后交付字节数、耗时及平均速度；不记录签名 URL、认证头、Cookie、异常原始消息或正文。代理重启后状态计数归零，但事件历史保留。下载与 UploadPart 上传是独立模块、独立并发额度。
+运行指标写入用户私有目录：`r2-download-status.json` 保存当前进程汇总，`r2-download-events.jsonl` 持久保存最近 1000 条下载事件。事件区分接管前失败、切换成功、完整传输完成和切换后传输中断，并记录接管后交付字节数、耗时及平均速度；不记录签名 URL、认证头、Cookie、异常原始消息或正文。代理重启后状态计数归零，但事件历史保留。下载与 UploadPart 上传是独立模块、独立并发额度。
 
 ## 更新恢复与网络边界
 

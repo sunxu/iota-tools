@@ -79,6 +79,8 @@ class _RequestContext:
     relay_started: bool = False
     slot_reserved_at: float | None = None
     slot_held_ms: float | None = None
+    takeover_trigger: str | None = None
+    capacity_bypassed: bool = False
 
 
 class _RateWindow:
@@ -165,6 +167,22 @@ def _same_representation(old: ClientResponse, new: ClientResponse) -> bool:
     return True
 
 
+def _same_unstarted_representation(old: ClientResponse, new: ClientResponse) -> bool:
+    """Validate original/replacement headers when no body was delivered."""
+    if old.status != new.status:
+        return False
+    old_length = _content_length(old)
+    if old_length is None or old_length != _content_length(new):
+        return False
+    for name in ("Content-Range", "Content-Encoding", "Content-Type", "Last-Modified"):
+        if old.headers.get(name, "") != new.headers.get(name, ""):
+            return False
+    etag = old.headers.get("ETag", "")
+    if etag and new.headers.get("ETag", "") != etag:
+        return False
+    return True
+
+
 def _content_length(response: Any) -> int | None:
     raw = response.headers.get("Content-Length")
     if raw is None:
@@ -191,9 +209,13 @@ class R2DownloadRouter:
         self.window_seconds = self.config["slow_window_seconds"]
         self.replacement_proxy = self.config["replacement_proxy"]
         self.max_concurrent = self.config["max_concurrent_takeovers"]
+        self.direct_takeover_threshold_bytes = (
+            self.config["direct_takeover_threshold_mib"] * 1024 * 1024
+        )
         self._token = secrets.token_urlsafe(32)
         self._contexts: dict[str, _RequestContext] = {}
         self._active_takeovers = 0
+        self._active_direct_takeovers = 0
         self._port: int | None = None
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
@@ -202,6 +224,8 @@ class R2DownloadRouter:
             "eligible_gets": 0,
             "slow_detected": 0,
             "takeover_started": 0,
+            "slow_takeover_started": 0,
+            "direct_takeover_started": 0,
             "takeover_succeeded": 0,
             "takeover_failed": 0,
             "takeover_completed": 0,
@@ -411,6 +435,16 @@ class R2DownloadRouter:
                 context.takeover_skip_reason = "RESPONSE_NOT_ELIGIBLE"
                 return await self._stream_without_takeover(request, upstream, context)
 
+            if self._should_direct_takeover(context, upstream):
+                replacement = await self._try_takeover(
+                    context, upstream, None, trigger="file_size"
+                )
+                if replacement is not None:
+                    upstream.close()
+                    upstream = replacement
+                    self._set_response_metadata(context, upstream)
+                    replacement_last_data_at = asyncio.get_running_loop().time()
+
             while True:
                 loop = asyncio.get_running_loop()
                 read_timeout = 1.0
@@ -573,15 +607,20 @@ class R2DownloadRouter:
         context.final_status = "completed"
         return downstream
 
-    def _reserve_slot(self, context: _RequestContext) -> bool:
+    def _reserve_slot(self, context: _RequestContext, *, bypass: bool = False) -> bool:
         if context.slot_reserved:
             return True
-        if self._active_takeovers >= self.max_concurrent:
+        if not bypass and self._active_takeovers >= self.max_concurrent:
             return False
-        self._active_takeovers += 1
+        if bypass:
+            self._active_direct_takeovers += 1
+        else:
+            self._active_takeovers += 1
         context.slot_reserved = True
+        context.capacity_bypassed = bypass
         context.slot_reserved_at = asyncio.get_running_loop().time()
         self._stats["takeover_started"] += 1
+        self._stats["direct_takeover_started" if bypass else "slow_takeover_started"] += 1
         self._write_status()
         return True
 
@@ -593,7 +632,10 @@ class R2DownloadRouter:
             context.slot_held_ms = round(max(0.0, now - context.slot_reserved_at) * 1000, 2)
         context.slot_reserved = False
         context.slot_reserved_at = None
-        self._active_takeovers = max(0, self._active_takeovers - 1)
+        if context.capacity_bypassed:
+            self._active_direct_takeovers = max(0, self._active_direct_takeovers - 1)
+        else:
+            self._active_takeovers = max(0, self._active_takeovers - 1)
         self._stats["takeover_slot_released"] += 1
         self._write_status()
 
@@ -609,6 +651,18 @@ class R2DownloadRouter:
     ) -> None:
         context.response_status = response.status
         context.response_content_length = _content_length(response)
+
+    def _should_direct_takeover(
+        self, context: _RequestContext, response: ClientResponse
+    ) -> bool:
+        size = _content_length(response)
+        return (
+            not context.takeover_attempted
+            and context.takeover_skip_reason is None
+            and _response_is_takeover_eligible(response, context)
+            and size is not None
+            and size > self.direct_takeover_threshold_bytes
+        )
 
     async def _consider_takeover(
         self, context: _RequestContext, original: ClientResponse | None, rate: float
@@ -710,6 +764,8 @@ class R2DownloadRouter:
                 "capacity_full_count": context.capacity_full_count,
                 "takeover_attempted": context.takeover_attempted,
                 "takeover_result": takeover_result,
+                "trigger": context.takeover_trigger,
+                "capacity_bypassed": context.capacity_bypassed,
                 "skip_reason": skip_reason,
                 "slot_held_ms": context.slot_held_ms,
                 "slow_threshold_kib_s": self.threshold_kib_s,
@@ -718,11 +774,17 @@ class R2DownloadRouter:
         )
 
     async def _try_takeover(
-        self, context: _RequestContext, original: ClientResponse | None, rate: float
+        self,
+        context: _RequestContext,
+        original: ClientResponse | None,
+        rate: float | None,
+        *,
+        trigger: str = "slow_speed",
     ) -> ClientResponse | None:
         if context.takeover_attempted:
             return None
-        if not self._reserve_slot(context):
+        bypass = trigger == "file_size"
+        if not self._reserve_slot(context, bypass=bypass):
             context.capacity_full_count += 1
             self._stats["capacity_skipped"] += 1
             if not context.capacity_full_event_recorded:
@@ -736,6 +798,7 @@ class R2DownloadRouter:
             return None
 
         context.takeover_attempted = True
+        context.takeover_trigger = trigger
         self._record(context, "takeover_started", rate=rate, stage="replacement_open")
         replacement: ClientResponse | None = None
         stage = "replacement_open"
@@ -763,6 +826,11 @@ class R2DownloadRouter:
             stage = "replacement_response_validation"
             if not _response_is_takeover_eligible(replacement, context):
                 raise ValueError("replacement_response_not_eligible")
+            if bypass and (
+                original is None
+                or not _same_unstarted_representation(original, replacement)
+            ):
+                raise ValueError("replacement_validator_mismatch")
 
             if context.delivered_bytes:
                 stage = "prefix_validation"
@@ -970,6 +1038,9 @@ class R2DownloadRouter:
             "replacement_avg_kib_s": replacement_avg_kib_s,
         }
         event.update({key: value for key, value in optional_fields.items() if value is not None})
+        if context.takeover_trigger is not None:
+            event["trigger"] = context.takeover_trigger
+            event["capacity_bypassed"] = context.capacity_bypassed
         if extra_fields:
             event.update(extra_fields)
         self._last_event = event
@@ -1017,7 +1088,11 @@ class R2DownloadRouter:
                 "updated_at": time.time(),
                 "relay_ready": self._port is not None,
                 "active_takeovers": self._active_takeovers,
+                "active_slow_takeovers": self._active_takeovers,
+                "active_direct_takeovers": self._active_direct_takeovers,
+                "active_total_takeovers": self._active_takeovers + self._active_direct_takeovers,
                 "max_concurrent_takeovers": self.max_concurrent,
+                "direct_takeover_threshold_mib": self.config["direct_takeover_threshold_mib"],
                 "slow_threshold_kib_s": self.threshold_kib_s,
                 "slow_window_seconds": self.window_seconds,
                 "event_history_file": self.event_history_path.name,

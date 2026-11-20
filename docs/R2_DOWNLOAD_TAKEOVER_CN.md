@@ -1,4 +1,4 @@
-# R2 GET 慢下载接管 V1
+# R2 GET 下载接管（大小直接触发 + 慢速触发）
 
 ## 设计结论
 
@@ -21,16 +21,17 @@ mitmproxy 11.0.2 的响应流回调是同步函数。它适合对单个 chunk �
 - 不接管 Bucket 列表、R2 管理 API、非 R2 GET、多 Range 或带正文的 GET。
 - 初始上游不配置代理；替换上游使用 TOML 指定的 loopback HTTP proxy。
 - 从请求进入 relay 开始计时，首个完整 10 秒窗口形成后，每秒检查最近 10 秒接收字节数。
-- 最近 10 秒字节数小于 5,120,000 bytes（500 KiB/s × 10 秒）时，尝试一次接管。
-- 每 GET 最多一次接管；全局名额非阻塞获取，满额立即放弃、不排队。
-- 全局并发上限从配置读取，默认 8。
+- 原始响应头返回后，若符合对象 GET 的本次响应 Content-Length 严格大于 TOML 中的 `direct_takeover_threshold_mib`（默认 24 MiB），立即尝试大文件接管；不等待速度窗口，也不占慢速接管名额。206 按本次 Range 响应长度判断；大小未知走原有慢速检测。
+- 其余 GET 最近 10 秒字节数小于 5,120,000 bytes（500 KiB/s × 10 秒）时，尝试慢速接管；从请求创建起的响应头等待阶段同样保留原有慢速判断。
+- 每 GET 最多一次实际接管尝试；慢速并发名额满时继续原连接并在后续窗口重新检查，不排队；达到 70% 已交付进度时不再发起慢速接管。
+- `max_concurrent_takeovers` 只限制慢速接管，默认 16；大文件直接接管不占该名额，但仍受 HTTP 客户端、代理和系统底层资源约束。
 - 替代响应正文（包括中途接管的前缀校验）连续 30 秒无数据时，终止下载并释放名额，不回退原始连接。
 
 ## 接管安全
 
 替换请求复用原始 URL 和端到端请求头，不构造 Range；代理 hop-by-hop 请求头不会转发。
 
-未向 IOTA 交付正文时，可以直接采用替换响应头和正文。已经交付正文时，必须满足：
+未向 IOTA 交付正文、且原始响应头尚未到达的慢速接管，可以直接采用替换响应。大文件接管必须已有原始响应头，因此要先验证状态、Content-Length、Content-Range、Content-Encoding、Content-Type、Last-Modified 与已有 ETag 一致，不一致则保留原连接。已经交付正文时，必须满足：
 - 状态码相同；
 - 两边有相同强 ETag；
 - Content-Length、Content-Range、Content-Encoding、Content-Type、Last-Modified 相同；
@@ -41,11 +42,11 @@ mitmproxy 11.0.2 的响应流回调是同步函数。它适合对单个 chunk �
 ## 运维和隐私
 
 - 内部 relay 仅绑定 127.0.0.1 的动态端口，不增加独立 Supervisor 子进程。
-- 全局接管并发名额在新代理连接、前缀验证及剩余正文传输期间占用；完成、失败、取消均释放。
+- 慢速接管名额在新代理连接、前缀验证及剩余正文传输期间占用；大文件直接接管独立计数、不占慢速名额；完成、失败、取消均清理计数。状态分别提供 active_slow_takeovers、active_direct_takeovers 和 active_total_takeovers。
 - `r2-download-status.json` 记录当前代理进程的计数、最后事件和事件历史文件名；进程重启后计数归零。
-- `r2-download-events.jsonl` 独立追加事件，最多保留最近 100 个事件；目录权限为 0700，文件权限为 0600，代理重启后历史保留。
+- `r2-download-events.jsonl` 独立追加事件，最多保留最近 1000 个事件；目录权限为 0700，文件权限为 0600，代理重启后历史保留。
 - `takeover_succeeded` 表示替代响应通过校验并完成切换；`takeover_completed` 才表示替代响应正文已完整交付。
-- 事件记录接管阶段、异常类型、替代响应建立耗时、前缀校验耗时/字节数，以及接管后交付字节数、耗时和平均 KiB/s。
+- 事件记录接管阶段、异常类型、替代响应建立耗时、前缀校验耗时/字节数，以及接管后交付字节数、耗时和平均 KiB/s。接管及下载汇总记录 trigger=file_size/slow_speed 与 capacity_bypassed；不含签名 URL。
 - `takeover_failed` 表示切换前失败；`takeover_stream_failed` 表示切换成功后传输中断；客户端取消单独记为 `takeover_stream_cancelled`。
 - 替代正文连续 30 秒无数据时记录 `takeover_stream_stalled` / `REPLACEMENT_STREAM_STALLED`：下游尚未收到响应头则返回 502；已开始响应则关闭连接，留下明确的不完整响应；两种情况都释放并发名额且不回退原始连接。
 - 不记录原始 URL、签名查询参数、认证请求头、Cookie、异常原始消息或响应正文；失败原因只记录固定校验原因或异常类型。

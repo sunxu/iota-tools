@@ -17,6 +17,7 @@ from r2_client.download import (
     _REPLACEMENT_STREAM_STALL_TIMEOUT,
     _RequestContext,
     _same_representation,
+    _same_unstarted_representation,
     _progress_percent,
 )
 from r2_client.eligibility import is_r2_object_get
@@ -86,6 +87,30 @@ class ValidatorTests(unittest.TestCase):
         self.assertFalse(_same_representation(old, new))
         new.headers["ETag"] = 'W/"v1"'
         self.assertFalse(_same_representation(old, new))
+
+
+class DirectResponseValidatorTests(unittest.TestCase):
+    def test_rejects_mismatched_length_range_and_etag(self):
+        old = SimpleNamespace(status=206, headers={
+            "Content-Length": "100", "Content-Range": "bytes 0-99/200",
+            "ETag": '"v1"', "Content-Type": "application/octet-stream",
+        })
+        new = SimpleNamespace(status=206, headers=dict(old.headers))
+        self.assertTrue(_same_unstarted_representation(old, new))
+        for field, value in (
+            ("Content-Length", "99"),
+            ("Content-Range", "bytes 100-199/200"),
+            ("ETag", '"v2"'),
+            ("Content-Type", "text/plain"),
+        ):
+            new.headers[field] = value
+            self.assertFalse(_same_unstarted_representation(old, new), field)
+            new.headers[field] = old.headers[field]
+
+    def test_no_etag_can_match_when_other_metadata_matches(self):
+        old = SimpleNamespace(status=200, headers={"Content-Length": "100"})
+        new = SimpleNamespace(status=200, headers={"Content-Length": "100"})
+        self.assertTrue(_same_unstarted_representation(old, new))
 
 
 class DownloadRouterUnitTests(unittest.IsolatedAsyncioTestCase):
@@ -369,6 +394,102 @@ class DownloadRouterUnitTests(unittest.IsolatedAsyncioTestCase):
         for context in contexts:
             self.router._release_slot(context)
 
+    async def test_direct_threshold_strictly_above_24_mib_and_uses_range_length(self):
+        ctx = _RequestContext("size-test", "https://example.invalid/x", (), None, False, 0.0)
+        threshold = self.router.direct_takeover_threshold_bytes
+        self.assertEqual(threshold, 24 * 1024 * 1024)
+        for size, expected in ((threshold - 1, False), (threshold, False), (threshold + 1, True)):
+            response = SimpleNamespace(
+                status=200, headers=CIMultiDict({"Content-Length": str(size)})
+            )
+            self.assertEqual(self.router._should_direct_takeover(ctx, response), expected)
+        no_length = SimpleNamespace(status=200, headers=CIMultiDict())
+        self.assertFalse(self.router._should_direct_takeover(ctx, no_length))
+        ctx.range_requested = True
+        range_response = SimpleNamespace(
+            status=206,
+            headers=CIMultiDict({
+                "Content-Length": str(16 * 1024 * 1024),
+                "Content-Range": f"bytes 0-{16 * 1024 * 1024 - 1}/{100 * 1024 * 1024}",
+            }),
+        )
+        self.assertFalse(self.router._should_direct_takeover(ctx, range_response))
+        range_response.headers["Content-Length"] = str(threshold + 1)
+        self.assertTrue(self.router._should_direct_takeover(ctx, range_response))
+
+    async def test_direct_takeover_ignores_full_slow_capacity_and_releases_independently(self):
+        occupied = [
+            _RequestContext(str(i), "https://example.invalid/x", (), None, False, 0.0)
+            for i in range(self.router.max_concurrent)
+        ]
+        for ctx in occupied:
+            self.assertTrue(self.router._reserve_slot(ctx))
+        target = _RequestContext(
+            "direct-size", "https://example.invalid/x", (), None, False,
+            asyncio.get_running_loop().time(),
+        )
+        original = SimpleNamespace(
+            status=200,
+            headers=CIMultiDict({"Content-Length": "100", "ETag": '"same"'}),
+        )
+        replacement = SimpleNamespace(
+            status=200,
+            headers=CIMultiDict({"Content-Length": "100", "ETag": '"same"'}),
+        )
+        self.router._open_upstream = AsyncMock(return_value=replacement)
+        result = await self.router._try_takeover(
+            target, original, None, trigger="file_size"
+        )
+        self.assertIs(result, replacement)
+        self.assertTrue(target.slot_reserved)
+        self.assertTrue(target.capacity_bypassed)
+        self.assertEqual(self.router._active_takeovers, self.router.max_concurrent)
+        self.assertEqual(self.router._active_direct_takeovers, 1)
+        self.assertEqual(self.router._stats["direct_takeover_started"], 1)
+        event = self.router._last_event
+        self.assertEqual(event["trigger"], "file_size")
+        self.assertTrue(event["capacity_bypassed"])
+        self.router._release_slot(target)
+        self.router._release_slot(target)
+        self.assertEqual(self.router._active_direct_takeovers, 0)
+        self.assertEqual(self.router._active_takeovers, self.router.max_concurrent)
+        for ctx in occupied:
+            self.router._release_slot(ctx)
+        self.assertEqual(self.router._active_takeovers, 0)
+        self.assertEqual(self.router._stats["takeover_slot_released"], len(occupied) + 1)
+
+    async def test_direct_takeover_rejects_mismatched_response_and_keeps_original(self):
+        ctx = _RequestContext(
+            "direct-mismatch", "https://example.invalid/x", (), None, False,
+            asyncio.get_running_loop().time(),
+        )
+        original = SimpleNamespace(
+            status=200, headers=CIMultiDict({
+                "Content-Length": "100", "ETag": '"old"',
+            })
+        )
+        replacement = SimpleNamespace(
+            status=200, headers=CIMultiDict({
+                "Content-Length": "100", "ETag": '"different"',
+            }), close=unittest.mock.Mock(),
+        )
+        self.router._open_upstream = AsyncMock(return_value=replacement)
+        result = await self.router._try_takeover(
+            ctx, original, None, trigger="file_size"
+        )
+        self.assertIsNone(result)
+        replacement.close.assert_called_once()
+        self.assertTrue(ctx.takeover_attempted)
+        self.assertEqual(self.router._stats["takeover_failed"], 1)
+        self.assertEqual(self.router._active_direct_takeovers, 0)
+        self.assertEqual(self.router._active_takeovers, 0)
+        event = self.router._last_event
+        self.assertEqual(event["stage"], "replacement_response_validation")
+        self.assertEqual(event["reason"], "replacement_validator_mismatch")
+        self.assertEqual(event["trigger"], "file_size")
+        self.router._record_download_summary(ctx)
+        self.assertEqual(self.router._last_event["trigger"], "file_size")
+
     async def test_capacity_full_does_not_consume_attempt_and_retries_after_release(self):
         occupied = [
             _RequestContext(str(i), "https://example.invalid/x", (), None, False, 0.0)
@@ -493,6 +614,78 @@ class DownloadRouterUnitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[-1]["result"], "test_event_1000")
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
+
+    async def test_fast_large_get_direct_takeover_without_waiting_for_slow_window(self):
+        body = bytes(range(128))
+        seen = []
+
+        async def origin(request):
+            return web.Response(
+                body=body,
+                headers={"ETag": '"v1"', "Content-Type": "application/octet-stream"},
+            )
+
+        async def replacement_proxy(request):
+            seen.append(request.raw_path)
+            return web.Response(
+                body=body,
+                headers={"ETag": '"v1"', "Content-Type": "application/octet-stream"},
+            )
+
+        async def start_server(handler):
+            app = web.Application()
+            app.router.add_route("*", "/{tail:.*}", handler)
+            runner = web.AppRunner(app, access_log=None)
+            await runner.setup()
+            site = web.TCPSite(runner, "127.0.0.1", 0)
+            await site.start()
+            port = site._server.sockets[0].getsockname()[1]
+            return runner, port
+
+        origin_runner, origin_port = await start_server(origin)
+        proxy_runner, proxy_port = await start_server(replacement_proxy)
+        self.router.replacement_proxy = f"http://127.0.0.1:{proxy_port}"
+        self.router.direct_takeover_threshold_bytes = 24
+        request_id = "fast-direct-size"
+        context = _RequestContext(
+            request_id,
+            f"http://127.0.0.1:{origin_port}/object?signature=unchanged",
+            ((b"Host", f"127.0.0.1:{origin_port}".encode()),),
+            "direct-test-client", False, asyncio.get_running_loop().time(),
+        )
+        self.router._contexts[request_id] = context
+        try:
+            async with ClientSessionForTest() as client:
+                response = await client.get(
+                    f"http://127.0.0.1:{self.router._port}/{request_id}",
+                    headers={
+                        "X-Iota-Download-Token": self.router._token,
+                        "X-Iota-Download-Request": request_id,
+                    },
+                )
+                self.assertEqual(response.status, 200)
+                self.assertEqual(await response.read(), body)
+
+            self.assertEqual(len(seen), 1)
+            self.assertIn("signature=unchanged", seen[0])
+            self.assertEqual(self.router._stats["takeover_succeeded"], 1)
+            self.assertEqual(self.router._stats["direct_takeover_started"], 1)
+            self.assertEqual(self.router._stats["slow_takeover_started"], 0)
+            self.assertEqual(self.router._active_direct_takeovers, 0)
+            events = [
+                json.loads(line) for line in self.router.event_history_path.read_text().splitlines()
+            ]
+            started = next(e for e in events if e["result"] == "takeover_started")
+            summary = next(e for e in events if e["result"] == "download_summary")
+            self.assertEqual(started["trigger"], "file_size")
+            self.assertTrue(started["capacity_bypassed"])
+            self.assertEqual(summary["trigger"], "file_size")
+            self.assertEqual(summary["takeover_result"], "completed")
+            self.assertEqual(summary["delivered_bytes"], len(body))
+            self.assertFalse(summary["slow_detected"])
+        finally:
+            await origin_runner.cleanup()
+            await proxy_runner.cleanup()
 
     async def test_relay_streams_and_takes_over_a_slow_request(self):
         body = bytes(range(256)) * 64
