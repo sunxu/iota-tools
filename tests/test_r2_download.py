@@ -496,6 +496,20 @@ class DownloadRouterUnitTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Authorization", warnings.output[0])
         self.assertIsInstance(original_path, property)
 
+    async def test_request_capture_refuses_symlink_without_following_it(self):
+        path = self.router.request_capture_path
+        target = Path(self._runtime_tmp.name) / "unrelated-file.txt"
+        target.write_text("keep-original")
+        target.chmod(0o644)
+        path.symlink_to(target)
+        with self.assertLogs("iota.r2.download", level="WARNING") as warnings:
+            self.router._capture_request(self._request_capture_context("symlink"), "GET")
+        self.assertEqual(target.read_text(), "keep-original")
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o644)
+        self.assertTrue(path.is_symlink())
+        self.assertEqual(len(warnings.output), 1)
+        self.assertIn("Unable to update private R2 download request history", warnings.output[0])
+
     async def test_request_capture_does_not_fsync(self):
         with patch("r2_client.download.os.fsync") as fsync:
             self.router._capture_request(self._request_capture_context("fsync"), "GET")

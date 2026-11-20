@@ -278,6 +278,8 @@ class R2DownloadRouter:
             path = self.request_capture_path
             path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             path.parent.chmod(0o700)
+            if path.is_symlink():
+                raise OSError("request capture path cannot be a symlink")
             if path.exists():
                 path.chmod(0o600)
                 if path.stat().st_size + len(encoded) > _REQUEST_CAPTURE_MAX_BYTES:
@@ -288,8 +290,8 @@ class R2DownloadRouter:
                 os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
                 0o600,
             )
-            os.fchmod(fd, 0o600)
             with os.fdopen(fd, "ab") as stream:
+                os.fchmod(stream.fileno(), 0o600)
                 stream.write(encoded)
             # Intentionally no per-record fsync: crash may lose the tail.
         except Exception:

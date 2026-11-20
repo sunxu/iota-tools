@@ -68,7 +68,9 @@ capture_requests = true
 
 接管使用相同 URL 和端到端请求头（代理 hop-by-hop 头除外），不构造 Range。大文件直接接管发生在原始响应头返回、尚未交付正文时，需要校验替代响应状态、长度、Content-Range 等元数据及已有 ETag；不一致则保留原始连接。若已向客户端交付正文，替换响应必须具有相同强 ETag、状态、长度、Content-Range、Content-Encoding、Content-Type 和 Last-Modified，并重新读取/校验已交付前缀 SHA-256；通过后丢弃前缀，只发送剩余字节。验证失败时继续仍可用的原连接；不能继续则以不完整响应失败，绝不拼接不一致数据。若没有强 ETag 且已有正文交付，则不接管。
 
-临时请求采集默认开启（`[r2.download] capture_requests = true`），只在下载 Relay 就绪且 R2 GET 符合入口条件时记录一次。私有 `r2-download-requests.jsonl` 保存完整签名 URL、原始有序请求头（含 Authorization/Cookie）及 replacement_proxy；主文件 10 MiB、轮转保留 `.1` 一份，权限目录 0700/文件 0600，不逐条 fsync，采集失败不影响下载。**这些记录相当于访问凭证**：只供本机受控诊断，不得上传、提交 Git、粘贴进对话或备份到公共位置。问题定位后设置 `capture_requests = false` 并手动安全清理两份日志；关闭采集不会自动删除旧文件。请求采集日志与以下普通诊断严格分离。\n\n运行指标写入用户私有目录：`r2-download-status.json` 保存当前进程汇总，`r2-download-events.jsonl` 持久保存最近 1000 条下载事件。事件区分接管前失败、切换成功、完整传输完成和切换后传输中断，并记录接管后交付字节数、耗时及平均速度；不记录签名 URL、认证头、Cookie、异常原始消息或正文。代理重启后状态计数归零，但事件历史保留。下载与 UploadPart 上传是独立模块、独立并发额度。
+临时请求采集默认开启（`[r2.download] capture_requests = true`），只在下载 Relay 就绪且 R2 GET 符合入口条件时记录一次。私有 `r2-download-requests.jsonl` 保存完整签名 URL、原始有序请求头（含 Authorization/Cookie）及 replacement_proxy；主文件 10 MiB、轮转保留 `.1` 一份，权限目录 0700/文件 0600，不逐条 fsync，采集失败不影响下载。**这些记录相当于访问凭证**：只供本机受控诊断，不得上传、提交 Git、粘贴进对话或备份到公共位置。问题定位后设置 `capture_requests = false` 并手动安全清理两份日志；关闭采集不会自动删除旧文件。请求采集日志与以下普通诊断严格分离。
+
+运行指标写入用户私有目录：`r2-download-status.json` 保存当前进程汇总，`r2-download-events.jsonl` 持久保存最近 1000 条下载事件。事件区分接管前失败、切换成功、完整传输完成和切换后传输中断，并记录接管后交付字节数、耗时及平均速度；不记录签名 URL、认证头、Cookie、异常原始消息或正文。代理重启后状态计数归零，但事件历史保留。下载与 UploadPart 上传是独立模块、独立并发额度。
 
 ## 更新恢复与网络边界
 
