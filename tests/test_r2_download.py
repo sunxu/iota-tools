@@ -615,6 +615,98 @@ class DownloadRouterUnitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(path.parent.stat().st_mode), 0o700)
 
+    async def test_direct_takeover_open_failure_continues_original_response(self):
+        body = b"original-response-must-remain-complete" * 4
+        seen = []
+
+        async def origin(request):
+            return web.Response(
+                body=body,
+                headers={"ETag": '"unchanged"', "Content-Type": "application/octet-stream"},
+            )
+
+        app = web.Application()
+        app.router.add_get("/object", origin)
+        runner = web.AppRunner(app, access_log=None)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        request_id = "failed-direct-continues-original"
+        ctx = _RequestContext(
+            request_id,
+            f"http://127.0.0.1:{port}/object",
+            ((b"Host", f"127.0.0.1:{port}".encode()),),
+            "direct-failure-client", False, asyncio.get_running_loop().time(),
+        )
+        self.router._contexts[request_id] = ctx
+        self.router.direct_takeover_threshold_bytes = 24
+        original_open = self.router._open_upstream
+
+        async def open_upstream(context, proxy=None):
+            if proxy:
+                seen.append(proxy)
+                raise ConnectionError("replacement-unavailable")
+            return await original_open(context)
+
+        self.router._open_upstream = open_upstream
+        try:
+            async with ClientSessionForTest() as client:
+                response = await client.get(
+                    f"http://127.0.0.1:{self.router._port}/{request_id}",
+                    headers={
+                        "X-Iota-Download-Token": self.router._token,
+                        "X-Iota-Download-Request": request_id,
+                    },
+                )
+                self.assertEqual(response.status, 200)
+                self.assertEqual(await response.read(), body)
+            self.assertEqual(len(seen), 1)
+            self.assertEqual(self.router._stats["takeover_failed"], 1)
+            self.assertEqual(self.router._active_direct_takeovers, 0)
+            self.assertEqual(self.router._active_takeovers, 0)
+            events = [
+                json.loads(line) for line in self.router.event_history_path.read_text().splitlines()
+            ]
+            failure = next(e for e in events if e["result"] == "takeover_failed")
+            summary = next(e for e in events if e["result"] == "download_summary")
+            self.assertEqual(failure["trigger"], "file_size")
+            self.assertEqual(failure["stage"], "replacement_open")
+            self.assertEqual(summary["final_status"], "completed")
+            self.assertEqual(summary["takeover_result"], "failed")
+            self.assertEqual(summary["delivered_bytes"], len(body))
+            self.assertTrue(summary["capacity_bypassed"])
+        finally:
+            await runner.cleanup()
+
+    async def test_direct_takeover_cancel_releases_direct_counter(self):
+        ctx = _RequestContext(
+            "direct-cancel", "https://example.invalid/x", (), None, False,
+            asyncio.get_running_loop().time(),
+        )
+        original = SimpleNamespace(
+            status=200, headers=CIMultiDict({"Content-Length": "100"})
+        )
+        opened = asyncio.Event()
+
+        async def pending_open(*args, **kwargs):
+            opened.set()
+            await asyncio.Event().wait()
+
+        self.router._open_upstream = pending_open
+        task = asyncio.create_task(
+            self.router._try_takeover(ctx, original, None, trigger="file_size")
+        )
+        await asyncio.wait_for(opened.wait(), timeout=2.0)
+        self.assertEqual(self.router._active_direct_takeovers, 1)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(self.router._active_direct_takeovers, 0)
+        self.assertEqual(self.router._active_takeovers, 0)
+        self.assertFalse(ctx.slot_reserved)
+        self.assertEqual(self.router._stats["takeover_slot_released"], 1)
+
     async def test_fast_large_get_direct_takeover_without_waiting_for_slow_window(self):
         body = bytes(range(128))
         seen = []
