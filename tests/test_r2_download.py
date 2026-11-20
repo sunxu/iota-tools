@@ -466,7 +466,7 @@ class DownloadRouterUnitTests(unittest.IsolatedAsyncioTestCase):
             self.assertLessEqual(backup.stat().st_size, first_size + 32)
             self.assertEqual(stat.S_IMODE(backup.stat().st_mode), 0o600)
         contents = path.read_bytes()
-        with patch("r2_client.download._REQUEST_CAPTURE_MAX_BYTES", first_size - 1):
+        with patch("r2_client.download._REQUEST_CAPTURE_MAX_BYTES", 1):
             self.router._capture_request(contexts[0], "GET")
         self.assertEqual(path.read_bytes(), contents)
 
