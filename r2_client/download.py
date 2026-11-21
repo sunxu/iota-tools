@@ -39,6 +39,20 @@ _REPLACEMENT_HEADER_TIMEOUT = 20.0
 _REPLACEMENT_STREAM_STALL_TIMEOUT = 30.0
 _EVENT_HISTORY_LIMIT = 1000
 _REQUEST_CAPTURE_MAX_BYTES = 10 * 1024 * 1024
+
+
+def _upstream_ssl_context(runtime: Path) -> ssl.SSLContext:
+    context = ssl.create_default_context(cafile=certifi.where())
+    extra_ca = os.environ.get("IOTA_R2_UPSTREAM_CA")
+    if not extra_ca:
+        # A running Supervisor may still hold the old services.py after a code
+        # update. Newly started mitmdump addons must find the existing CA bundle.
+        bundle = runtime / "relay-upstream-ca.pem"
+        if bundle.is_file():
+            extra_ca = str(bundle)
+    if extra_ca:
+        context.load_verify_locations(cafile=extra_ca)
+    return context
 _HOP_BY_HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade",
@@ -303,10 +317,7 @@ class R2DownloadRouter:
             return
         try:
             ensure_runtime(self.settings)
-            ssl_context = ssl.create_default_context(cafile=certifi.where())
-            extra_ca = os.environ.get("IOTA_R2_UPSTREAM_CA")
-            if extra_ca:
-                ssl_context.load_verify_locations(cafile=extra_ca)
+            ssl_context = _upstream_ssl_context(self.settings.runtime)
             timeout = ClientTimeout(total=None, connect=20, sock_connect=15, sock_read=None)
             connector = TCPConnector(ssl=ssl_context, limit=100, enable_cleanup_closed=True)
             self._session = ClientSession(
