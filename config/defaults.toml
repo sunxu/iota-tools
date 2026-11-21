@@ -1,0 +1,44 @@
+schema_version = 1
+
+[app]
+path = "/Applications/IOTA Train at Home.app"
+
+[supervisor]
+scan_seconds = 2
+update_grace_seconds = 180
+restart_delay_seconds = 15
+max_restarts_per_hour = 3
+
+[proxy]
+port = 8899
+
+[speedtest]
+enabled = true
+host = "speedtest.jsqiuying.com"
+port = 8877
+mbps = 500
+
+[r2]
+enabled = true
+
+[r2.upload]
+primary_proxy = "http://127.0.0.1:18585"
+fallback_proxy = "http://127.0.0.1:7890"
+max_concurrency = 5
+fallback_max_concurrency = 2
+fallback_direct = false
+probe_interval_seconds = 5
+probe_timeout_seconds = 2
+
+[r2.download]
+enabled = true
+slow_threshold_kib_s = 500
+slow_window_seconds = 10
+direct_takeover_threshold_mib = 24
+capture_requests = true
+replacement_proxy = "http://127.0.0.1:7893"
+max_concurrent_takeovers = 16
+
+[certificates]
+relay_root_ca = "~/r2-relay-root.crt"
+relay_mitm_ca = "~/.mitmproxy/mitmproxy-ca-cert.pem"

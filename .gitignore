@@ -1,0 +1,21 @@
+# No credentials, certificates, local environments, or logs in Git
+.venv/
+.runtime/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.log
+*.jsonl
+r2-download-requests.jsonl*
+*.pem
+*.crt
+*.key
+key
+*.p12
+*.pfx
+.env
+config.local.toml
+.DS_Store
+__MACOSX/
+backup-*/
