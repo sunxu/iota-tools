@@ -159,7 +159,11 @@ def start_proxy(settings: Settings) -> subprocess.Popen:
     trust_path = runtime / "relay-upstream-ca.pem"
     relay_ready = relay_ca_available(settings) and trust_path.is_file()
     env["IOTA_RELAY_CA_READY"] = "1" if relay_ready else "0"
+    # The download aiohttp connector uses an explicit SSLContext; give it the
+    # same upstream trust bundle as mitmdump, without inheriting a stale override.
+    env.pop("IOTA_R2_UPSTREAM_CA", None)
     if relay_ready:
+        env["IOTA_R2_UPSTREAM_CA"] = str(trust_path)
         args.extend(["--set", f"ssl_verify_upstream_trusted_ca={trust_path}"])
     return subprocess.Popen(args, cwd=ROOT, env=env, start_new_session=True)
 
