@@ -1,11 +1,12 @@
 import asyncio
 import json
+import os
 import stat
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, PropertyMock, patch
+from unittest.mock import AsyncMock, Mock, PropertyMock, patch
 
 from aiohttp import ClientPayloadError, web
 from multidict import CIMultiDict
@@ -14,6 +15,7 @@ from mitmproxy import http
 from r2_client.download import (
     R2DownloadRouter,
     _RateWindow,
+    _upstream_ssl_context,
     _REPLACEMENT_STREAM_STALL_TIMEOUT,
     _REQUEST_CAPTURE_MAX_BYTES,
     _RequestContext,
@@ -26,6 +28,29 @@ from tah_control.config import Settings, load_settings
 
 
 HOST = "assets.1234567890abcdef.r2.cloudflarestorage.com"
+
+
+class UpstreamTrustTests(unittest.TestCase):
+    def test_uses_existing_runtime_bundle_without_supervisor_env(self):
+        with tempfile.TemporaryDirectory() as temp:
+            runtime = Path(temp)
+            bundle = runtime / "relay-upstream-ca.pem"
+            bundle.write_text("test placeholder")
+            context = SimpleNamespace(load_verify_locations=Mock())
+            with patch("r2_client.download.ssl.create_default_context", return_value=context), \
+                 patch("r2_client.download.certifi.where", return_value="/certifi.pem"):
+                with patch.dict(os.environ, {}, clear=True):
+                    self.assertIs(_upstream_ssl_context(runtime), context)
+                    context.load_verify_locations.assert_called_once_with(cafile=str(bundle))
+                context.load_verify_locations.reset_mock()
+                with patch.dict(os.environ, {"IOTA_R2_UPSTREAM_CA": "/explicit/ca.pem"}, clear=True):
+                    _upstream_ssl_context(runtime)
+                    context.load_verify_locations.assert_called_once_with(cafile="/explicit/ca.pem")
+                bundle.unlink()
+                context.load_verify_locations.reset_mock()
+                with patch.dict(os.environ, {}, clear=True):
+                    _upstream_ssl_context(runtime)
+                    context.load_verify_locations.assert_not_called()
 
 
 class EligibilityTests(unittest.TestCase):
