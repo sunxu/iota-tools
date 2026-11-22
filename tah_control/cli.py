@@ -35,6 +35,80 @@ def preflight(s) -> dict:
 
 
 
+_RELOAD_PROGRESS_STAGES = {
+    "WAITING_BUSY", "IDLE_CONFIRMING", "PREFLIGHT",
+    "STOPPING", "STARTING", "VERIFYING",
+}
+_RELOAD_WAIT_STAGES = {"WAITING_BUSY", "IDLE_CONFIRMING"}
+
+
+def _reload_progress_line(stage: str, counts: object, old_pid: object,
+                          new_pid: object, elapsed: int, remaining: int) -> str:
+    """Format only trusted phase names and numeric diagnostics, never raw fields."""
+    def number(value: object) -> str:
+        return str(value) if type(value) is int and value >= 0 else "?"
+
+    if not isinstance(counts, dict):
+        counts = {}
+    if stage == "WAITING_BUSY":
+        details = " ".join(
+            f"{label}={number(counts.get(key))}"
+            for label, key in (
+                ("HTTP", "active_http_flows"), ("TCP", "active_tcp_flows"),
+                ("WebSocket", "active_websockets"), ("Tunnel", "active_tunnels"),
+            )
+        )
+        return f"{stage} {details} elapsed={elapsed}s remaining={remaining}s"
+    if stage == "IDLE_CONFIRMING":
+        return f"{stage} elapsed={elapsed}s remaining={remaining}s"
+    if stage == "PREFLIGHT":
+        return "PREFLIGHT checking configuration, addons and CA"
+    if stage == "STOPPING":
+        return f"STOPPING mitmdump_pid={number(old_pid)}"
+    if stage == "STARTING":
+        return "STARTING new mitmdump"
+    if stage == "VERIFYING":
+        return f"VERIFYING mitmdump_pid={number(new_pid)}"
+    return ""
+
+
+def _report_reload_progress(
+    progress: object, request_id: str, seen_seq: int,
+    last_output_at: float, elapsed: float, remaining: int,
+) -> tuple[int, float]:
+    """Print each phase transition once, plus waiting heartbeat every 10 s."""
+    if not isinstance(progress, dict) or progress.get("request_id") != request_id:
+        return seen_seq, last_output_at
+    events = progress.get("events")
+    if not isinstance(events, list):
+        return seen_seq, last_output_at
+    minute, second = divmod(int(max(0, elapsed)), 60)
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        seq, stage = event.get("seq"), event.get("stage")
+        if (type(seq) is not int or seq <= seen_seq
+                or stage not in _RELOAD_PROGRESS_STAGES):
+            continue
+        message = _reload_progress_line(
+            stage, event.get("counts"), event.get("old_pid"),
+            event.get("new_pid"), int(elapsed), remaining,
+        )
+        print(f"[{minute:02}:{second:02}] {message}", file=sys.stderr, flush=True)
+        seen_seq = seq
+        last_output_at = elapsed
+    if (progress.get("stage") in _RELOAD_WAIT_STAGES
+            and last_output_at >= 0 and elapsed - last_output_at >= 10):
+        stage = progress["stage"]
+        message = _reload_progress_line(
+            stage, progress.get("counts"), progress.get("old_pid"),
+            progress.get("new_pid"), int(elapsed), remaining,
+        )
+        print(f"[{minute:02}:{second:02}] {message}", file=sys.stderr, flush=True)
+        last_output_at = elapsed
+    return seen_seq, last_output_at
+
+
 def reload_proxy_command(settings, wait_seconds: int) -> int:
     """Submit one manual command; only the existing Supervisor owns mitmdump."""
     if not 0 <= wait_seconds <= 3600:
@@ -72,10 +146,24 @@ def reload_proxy_command(settings, wait_seconds: int) -> int:
             "deadline": time.time() + wait_seconds,
         }
         atomic_json(runtime / "reload-proxy-request.json", request)
+        print(f"[00:00] REQUESTED mitmdump_pid={proxy_pid} wait={wait_seconds}s",
+              file=sys.stderr, flush=True)
         # The Supervisor needs time for its scan loop, preflight and startup
         # after the last admissible idle snapshot.
-        until = time.monotonic() + wait_seconds + 45
+        started = time.monotonic()
+        until = started + wait_seconds + 45
+        seen_seq = 0
+        last_output_at = -1.0
         while time.monotonic() < until:
+            try:
+                progress = json.loads((runtime / "reload-proxy-progress.json").read_text())
+                seen_seq, last_output_at = _report_reload_progress(
+                    progress, request_id, seen_seq, last_output_at,
+                    time.monotonic() - started,
+                    max(0, int(request["deadline"] - time.time())),
+                )
+            except (OSError, ValueError):
+                pass
             try:
                 result = json.loads((runtime / "reload-proxy-result.json").read_text())
                 if result.get("request_id") == request_id:
