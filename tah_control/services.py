@@ -158,6 +158,10 @@ def proxy_preflight(settings: Settings) -> None:
         modules.append("speedtest.addon")
     if settings.section("r2")["enabled"]:
         modules.append("r2_client.addon")
+    # Check the stable watched scripts while the old mitmdump still serves.
+    # A corrupted wrapper must fail preflight, not fail after the old stop.
+    for module in modules:
+        _proxy_loader(runtime / "mitmproxy", module)
     env = clean_env()
     env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     env["PYTHONDONTWRITEBYTECODE"] = "1"
