@@ -21,3 +21,13 @@ def request(flow: http.HTTPFlow) -> None:
             "Content-Type": "application/xml; charset=utf-8",
             "Cache-Control": "no-store",
         })
+
+
+class SpeedtestServerListAddon:
+    """Expose the existing handler through the mitmdump addon contract."""
+
+    def request(self, flow: http.HTTPFlow) -> None:
+        request(flow)
+
+
+addons = [SpeedtestServerListAddon()]
