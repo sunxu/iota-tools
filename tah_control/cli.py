@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 from pathlib import Path
 import sys
 import time
+import uuid
 
 from tah_control import macos, services
 from tah_control.config import load_settings, ensure_runtime
@@ -32,6 +34,61 @@ def preflight(s) -> dict:
     return checks
 
 
+
+def reload_proxy_command(settings, wait_seconds: int) -> int:
+    """Submit one manual command; only the existing Supervisor owns mitmdump."""
+    if not 0 <= wait_seconds <= 3600:
+        raise ValueError("--wait must be between 0 and 3600 seconds")
+    runtime = settings.runtime
+    lock_path = runtime / "reload-proxy-cli.lock"
+    with lock_path.open("a+") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(json.dumps({"status": "BUSY", "reason": "ANOTHER_RELOAD_RUNNING"}))
+            return 1
+        status_file = runtime / "status.json"
+        try:
+            state = json.loads(status_file.read_text())
+            supervisor_pid = state["supervisor_pid"]
+            proxy_pid = state["proxy_pid"]
+            if (type(supervisor_pid) is not int or type(proxy_pid) is not int
+                    or time.time() - state["timestamp"] > 10
+                    or state["desired"] != "run"):
+                raise ValueError("stale Supervisor status")
+            os.kill(supervisor_pid, 0)
+            os.kill(proxy_pid, 0)
+        except (OSError, KeyError, TypeError, ValueError):
+            print(json.dumps({"status": "PREFLIGHT_FAILED",
+                              "reason": "SUPERVISOR_OR_PROXY_NOT_RUNNING"}))
+            return 1
+
+        request_id = uuid.uuid4().hex
+        request = {
+            "request_id": request_id,
+            "expected_supervisor_pid": supervisor_pid,
+            "expected_proxy_pid": proxy_pid,
+            "wait_seconds": wait_seconds,
+            "deadline": time.time() + wait_seconds,
+        }
+        atomic_json(runtime / "reload-proxy-request.json", request)
+        # The Supervisor needs time for its scan loop, preflight and startup
+        # after the last admissible idle snapshot.
+        until = time.monotonic() + wait_seconds + 45
+        while time.monotonic() < until:
+            try:
+                result = json.loads((runtime / "reload-proxy-result.json").read_text())
+                if result.get("request_id") == request_id:
+                    print(json.dumps(result, ensure_ascii=False))
+                    return 0 if result.get("status") == "APPLIED" else 1
+            except (OSError, ValueError):
+                pass
+            time.sleep(0.2)
+        print(json.dumps({"status": "FAILED", "reason": "SUPERVISOR_RESULT_TIMEOUT",
+                          "request_id": request_id}))
+        return 1
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="tah-control")
     p.add_argument("--config", type=Path, help="machine-local TOML override")
@@ -39,6 +96,8 @@ def main(argv=None) -> int:
     for action in ("install", "uninstall", "start", "stop", "restart", "reload", "run",
                    "status", "check", "logs", "finder"):
         sub.add_parser(action)
+    proxy_reload = sub.add_parser("reload-proxy")
+    proxy_reload.add_argument("--wait", type=int, default=120, metavar="SECONDS")
     args = p.parse_args(argv)
     try:
         settings = load_settings(args.config)
@@ -75,6 +134,8 @@ def main(argv=None) -> int:
                 macos.kickstart()
             print("Supervisor requested to " + ("restart IOTA" if action == "restart" else "run"))
             return 0
+        if action == "reload-proxy":
+            return reload_proxy_command(settings, args.wait)
         if action == "reload":
             macos.kickstart(restart=True)
             print("Supervisor reload requested; managed app and proxy will restart")
