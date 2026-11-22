@@ -955,10 +955,9 @@ class R2DownloadRouter:
         except Exception as exc:
             if replacement:
                 replacement.close()
-            if stage == "prefix_validation" and isinstance(exc, asyncio.TimeoutError):
-                self._record_replacement_stream_stalled(context, stage=stage)
-                self._release_slot(context)
-                raise _ReplacementStreamStalled() from exc
+            # No handoff has occurred during prefix validation. Keep the
+            # original upstream alive and let the normal failure path fall
+            # back to it, even when the replacement body times out.
             self._stats["takeover_failed"] += 1
             safe_reasons = {
                 "replacement_response_not_eligible", "replacement_validator_mismatch",
