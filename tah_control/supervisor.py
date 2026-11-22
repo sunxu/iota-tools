@@ -16,7 +16,7 @@ import signal
 import subprocess
 import time
 
-from tah_control.config import Settings, ensure_runtime
+from tah_control.config import Settings, ensure_runtime, load_settings
 from tah_control import services
 
 
@@ -103,6 +103,8 @@ class Supervisor:
         self.running = True
         self.state = "starting"
         self.error = ""
+        self._reload_idle_id: str | None = None
+        self._reload_idle_since: float | None = None
 
     def status(self) -> None:
         atomic_json(self.s.runtime / "status.json", {
@@ -128,6 +130,158 @@ class Supervisor:
                 services.stop_owned(self.proxy)
                 self.proxy = services.start_proxy(self.s)
                 services.wait_proxy(self.s, self.proxy)
+
+
+    def _activity_snapshot(self, pid: int) -> dict:
+        """Fail closed on stale/missing/invalid activity; never infer idleness."""
+        try:
+            data = json.loads((self.s.runtime / "proxy-activity.json").read_text())
+            timestamp = data["timestamp"]
+            if data["process_pid"] != pid or type(timestamp) not in (int, float):
+                raise ValueError("wrong PID or timestamp")
+            age = time.time() - timestamp
+            if age < -2 or age > 6:
+                raise ValueError("stale activity snapshot")
+            for key in ("active_http_flows", "active_tcp_flows",
+                        "active_websockets", "active_tunnels"):
+                if type(data[key]) is not int or data[key] < 0:
+                    raise ValueError("invalid activity count")
+            if not isinstance(data["build_id"], str) or len(data["build_id"]) != 16:
+                raise ValueError("invalid build identity")
+            return data
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError("proxy activity is unavailable or stale") from None
+
+    def _reload_result(self, request_id: str, status: str, **details) -> None:
+        # Remove the request *before* publishing its result so the next CLI
+        # cannot lose a new request to an old request's cleanup.
+        (self.s.runtime / "reload-proxy-request.json").unlink(missing_ok=True)
+        atomic_json(self.s.runtime / "reload-proxy-result.json", {
+            "request_id": request_id, "status": status,
+            "timestamp": time.time(), **details,
+        })
+        self._reload_idle_id = None
+        self._reload_idle_since = None
+
+    def _reload_proxy_tick(self) -> None:
+        path = self.s.runtime / "reload-proxy-request.json"
+        if not path.is_file():
+            self._reload_idle_id = None
+            self._reload_idle_since = None
+            return
+        try:
+            request = json.loads(path.read_text())
+            request_id = request["request_id"]
+            if (not isinstance(request_id, str) or len(request_id) != 32
+                    or any(char not in "0123456789abcdef" for char in request_id)):
+                raise ValueError("invalid request_id")
+            old_pid = request["expected_proxy_pid"]
+            supervisor_pid = request["expected_supervisor_pid"]
+            deadline = request["deadline"]
+            wait_seconds = request["wait_seconds"]
+            if (type(old_pid) is not int or type(supervisor_pid) is not int
+                    or type(deadline) not in (int, float)
+                    or type(wait_seconds) is not int or not 0 <= wait_seconds <= 3600):
+                raise ValueError("invalid reload request")
+        except (OSError, KeyError, ValueError, TypeError):
+            # Invalid private requests never trigger a service operation.
+            path.unlink(missing_ok=True)
+            return
+
+        if self._reload_idle_id != request_id:
+            self._reload_idle_id = request_id
+            self._reload_idle_since = None
+        proc = self.proxy
+        if (supervisor_pid != os.getpid() or proc is None or proc.poll() is not None
+                or proc.pid != old_pid):
+            self._reload_result(request_id, "PREFLIGHT_FAILED", old_pid=old_pid,
+                                reason="PROCESS_IDENTITY_CHANGED")
+            return
+        try:
+            snapshot = self._activity_snapshot(old_pid)
+        except RuntimeError:
+            self._reload_result(request_id, "PREFLIGHT_FAILED", old_pid=old_pid,
+                                reason="ACTIVITY_UNAVAILABLE")
+            return
+        busy = sum(snapshot[key] for key in (
+            "active_http_flows", "active_tcp_flows", "active_websockets", "active_tunnels"
+        ))
+        now = time.time()
+        if busy:
+            self._reload_idle_since = None
+            if now >= deadline:
+                self._reload_result(request_id, "BUSY", old_pid=old_pid,
+                                    reason="ACTIVE_PROXY_TRAFFIC")
+            return
+        if self._reload_idle_since is None:
+            self._reload_idle_since = time.monotonic()
+            if wait_seconds > 0 and now < deadline:
+                return
+        # Two separate idle observations (unless --wait 0 explicitly requests
+        # one immediate snapshot). No claim of strict zero-downtime draining.
+        if (wait_seconds > 0 and time.monotonic() - self._reload_idle_since
+                < self.s.section("supervisor")["scan_seconds"]):
+            if now >= deadline:
+                self._reload_result(request_id, "BUSY", old_pid=old_pid,
+                                    reason="IDLE_WINDOW_NOT_REACHED")
+            return
+
+        try:
+            fresh = load_settings(self.s.source)
+            if (fresh.section("proxy")["port"] != self.s.section("proxy")["port"]
+                    or fresh.section("speedtest") != self.s.section("speedtest")):
+                raise RuntimeError("proxy port or Speedtest settings changed")
+            services.proxy_preflight(fresh)
+            # Refuse to switch if work started while preflight was running.
+            recent = self._activity_snapshot(old_pid)
+            if any(recent[key] for key in (
+                "active_http_flows", "active_tcp_flows",
+                "active_websockets", "active_tunnels"
+            )):
+                self._reload_idle_since = None
+                if time.time() >= deadline:
+                    self._reload_result(request_id, "BUSY", old_pid=old_pid,
+                                        reason="ACTIVE_PROXY_TRAFFIC")
+                return
+        except (OSError, RuntimeError, ValueError) as exc:
+            self._reload_result(request_id, "PREFLIGHT_FAILED", old_pid=old_pid,
+                                reason=type(exc).__name__)
+            return
+
+        new_pid = None
+        try:
+            services.stop_proxy_for_reload(proc)
+            self.proxy = None
+            new_proxy = services.start_proxy(fresh, reload_only=True)
+            self.proxy = new_proxy
+            new_pid = new_proxy.pid
+            services.wait_proxy(fresh, new_proxy)
+            # Verify actual addon startup, not just an open TCP listening port.
+            until = time.monotonic() + 10
+            while True:
+                try:
+                    active = self._activity_snapshot(new_pid)
+                    if fresh.section("r2")["enabled"] and fresh.section("r2", "download")["enabled"]:
+                        downloaded = json.loads(
+                            (fresh.runtime / "r2-download-status.json").read_text()
+                        )
+                        if (downloaded.get("process_pid") != new_pid
+                                or downloaded.get("relay_ready") is not True):
+                            raise RuntimeError("download addon not ready")
+                    break
+                except (OSError, RuntimeError, ValueError):
+                    if new_proxy.poll() is not None or time.monotonic() >= until:
+                        raise RuntimeError("new mitmdump health check failed")
+                    time.sleep(0.2)
+            self._reload_result(request_id, "APPLIED",
+                                old_pid=old_pid, new_pid=new_pid,
+                                old_build_id=snapshot["build_id"],
+                                new_build_id=active["build_id"])
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+            # No automatic code rollback. The ordinary Supervisor recovery loop
+            # remains responsible for later restarts of a failed new process.
+            self._reload_result(request_id, "FAILED", old_pid=old_pid,
+                                new_pid=new_pid, reason=type(exc).__name__)
 
     def _restarts_available(self) -> bool:
         path = self.s.runtime / "app-restarts.json"
@@ -221,6 +375,7 @@ class Supervisor:
             return
         try:
             self._start_children()
+            self._reload_proxy_tick()
             restart = self.s.runtime / "restart-request.json"
             if restart.is_file():
                 restart.unlink()
