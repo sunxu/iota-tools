@@ -1,4 +1,6 @@
 """Offline tests for the manually triggered mitmdump-only reload contract."""
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 import json
 import os
 from pathlib import Path
@@ -9,7 +11,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from tah_control import services
-from tah_control.cli import reload_proxy_command
+from tah_control.cli import _report_reload_progress, reload_proxy_command
 from tah_control.config import Settings, load_settings
 from tah_control.proxy_activity import ProxyActivity
 from tah_control.supervisor import Supervisor, atomic_json
@@ -104,12 +106,47 @@ class ReloadSupervisorTests(unittest.TestCase):
     def _result(self):
         return json.loads((self.root / "reload-proxy-result.json").read_text())
 
+    def test_progress_scoped_to_request_and_records_only_safe_fields(self):
+        request_id = "a" * 32
+        self._activity(http=4)
+        snapshot = self.supervisor._activity_snapshot(32101)
+        self.supervisor._reload_progress(
+            request_id, "WAITING_BUSY", old_pid=32101, snapshot=snapshot
+        )
+        self._activity(http=2)
+        self.supervisor._reload_progress(
+            request_id, "WAITING_BUSY", old_pid=32101,
+            snapshot=self.supervisor._activity_snapshot(32101)
+        )
+        self.supervisor._reload_progress(request_id, "PREFLIGHT", old_pid=32101)
+        progress_file = self.root / "reload-proxy-progress.json"
+        progress = json.loads(progress_file.read_text())
+        self.assertEqual(progress["request_id"], request_id)
+        self.assertEqual(progress["last_seq"], 2)
+        self.assertEqual(
+            [event["stage"] for event in progress["events"]],
+            ["WAITING_BUSY", "PREFLIGHT"],
+        )
+        self.assertEqual(progress["events"][0]["counts"]["active_http_flows"], 4)
+        self.assertNotIn("Authorization", progress_file.read_text())
+        self.assertNotIn("https://", progress_file.read_text())
+        self.supervisor._reload_progress("b" * 32, "STOPPING", old_pid=32101)
+        self.assertEqual(json.loads(progress_file.read_text())["last_seq"], 1)
+        self.assertEqual(json.loads(progress_file.read_text())["request_id"], "b" * 32)
+
+    def test_progress_write_failure_does_not_affect_reload(self):
+        with patch("tah_control.supervisor.atomic_json", side_effect=OSError("read-only")):
+            self.supervisor._reload_progress("a" * 32, "PREFLIGHT", old_pid=32101)
+
     @patch("tah_control.supervisor.services.stop_proxy_for_reload")
     def test_busy_proxy_is_not_stopped(self, stop):
         self._activity(http=1)
         self._request(wait=0)
         self.supervisor._reload_proxy_tick()
         self.assertEqual(self._result()["status"], "BUSY")
+        progress = json.loads((self.root / "reload-proxy-progress.json").read_text())
+        self.assertEqual(progress["stage"], "WAITING_BUSY")
+        self.assertEqual(progress["counts"]["active_http_flows"], 1)
         self.assertIs(self.supervisor.proxy, self.old_proc)
         stop.assert_not_called()
 
@@ -164,6 +201,12 @@ class ReloadSupervisorTests(unittest.TestCase):
         preflight.assert_called_once()
         wait.assert_called_once()
         self.assertFalse((self.root / "reload-proxy-request.json").exists())
+        progress = json.loads((self.root / "reload-proxy-progress.json").read_text())
+        self.assertEqual(
+            [event["stage"] for event in progress["events"]],
+            ["IDLE_CONFIRMING", "PREFLIGHT", "STOPPING", "STARTING", "VERIFYING"],
+        )
+        self.assertEqual(progress["events"][-1]["new_pid"], 32102)
         # No IOTA or Speedtest control path is called by this operation.
         self.supervisor._reload_proxy_tick()
         stop.assert_called_once()
@@ -211,6 +254,120 @@ class ReloadSupervisorTests(unittest.TestCase):
 
 
 class ReloadCliTests(unittest.TestCase):
+    def test_progress_is_limited_to_transitions_and_ten_second_heartbeats(self):
+        request_id = "c" * 32
+        counts = {
+            "active_http_flows": 4, "active_tcp_flows": 0,
+            "active_websockets": 0, "active_tunnels": 0,
+        }
+        progress = {
+            "request_id": request_id, "stage": "WAITING_BUSY",
+            "counts": counts, "old_pid": 32101,
+            "events": [{
+                "seq": 1, "stage": "WAITING_BUSY",
+                "counts": counts, "old_pid": 32101,
+            }],
+        }
+        out = StringIO()
+        with redirect_stderr(out):
+            seq, last = _report_reload_progress(
+                progress, request_id, 0, -1, 2, 118
+            )
+            seq, last = _report_reload_progress(
+                progress, request_id, seq, last, 7, 113
+            )
+            progress["counts"] = {**counts, "active_http_flows": 2}
+            seq, last = _report_reload_progress(
+                progress, request_id, seq, last, 12, 108
+            )
+            seq, last = _report_reload_progress(
+                progress, "different-request", seq, last, 25, 95
+            )
+        lines = out.getvalue().splitlines()
+        self.assertEqual(len(lines), 2)
+        self.assertIn("[00:02] WAITING_BUSY HTTP=4", lines[0])
+        self.assertIn("[00:12] WAITING_BUSY HTTP=2", lines[1])
+        self.assertEqual(seq, 1)
+
+    def test_short_lived_phases_are_printed_from_history(self):
+        request_id = "c" * 32
+        phases = ("IDLE_CONFIRMING", "PREFLIGHT", "STOPPING",
+                  "STARTING", "VERIFYING")
+        progress = {
+            "request_id": request_id, "stage": "VERIFYING",
+            "events": [
+                {"seq": index, "stage": phase,
+                 "old_pid": 32101, "new_pid": 32102}
+                for index, phase in enumerate(phases, 1)
+            ],
+        }
+        stderr = StringIO()
+        with redirect_stderr(stderr):
+            seq, _ = _report_reload_progress(progress, request_id, 0, -1, 5, 115)
+        self.assertEqual(seq, 5)
+        self.assertEqual(
+            [phase for line in stderr.getvalue().splitlines()
+             for phase in phases if phase in line], list(phases),
+        )
+        self.assertIn("mitmdump_pid=32102", stderr.getvalue())
+
+    def test_invalid_or_unrelated_progress_cannot_print_private_values(self):
+        private = "https://example.com/private?token=secret"
+        progress = {
+            "request_id": "c" * 32, "stage": ["invalid"],
+            "url": private,
+            "events": [
+                {"seq": 1, "stage": "unknown", "url": private},
+                {"seq": 2, "stage": ["invalid"], "url": private},
+            ],
+        }
+        stderr = StringIO()
+        with redirect_stderr(stderr):
+            seq, _ = _report_reload_progress(
+                progress, "c" * 32, 0, -1, 2, 118
+            )
+            _report_reload_progress(progress, "d" * 32, seq, -1, 15, 100)
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_command_preserves_one_json_line_on_stdout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.object(Settings, "runtime", new_callable=lambda: property(lambda _: root)):
+                settings = load_settings(root / "not-existing.toml")
+                atomic_json(root / "status.json", {
+                    "supervisor_pid": os.getpid(), "proxy_pid": os.getpid(),
+                    "timestamp": time.time(), "desired": "run",
+                })
+
+                def respond(_):
+                    request_id = json.loads(
+                        (root / "reload-proxy-request.json").read_text()
+                    )["request_id"]
+                    atomic_json(root / "reload-proxy-progress.json", {
+                        "request_id": request_id, "stage": "VERIFYING",
+                        "events": [
+                            {"seq": 1, "stage": "PREFLIGHT", "old_pid": os.getpid()},
+                            {"seq": 2, "stage": "STOPPING", "old_pid": os.getpid()},
+                            {"seq": 3, "stage": "STARTING", "old_pid": os.getpid()},
+                            {"seq": 4, "stage": "VERIFYING", "new_pid": 98765},
+                        ],
+                    })
+                    atomic_json(root / "reload-proxy-result.json", {
+                        "request_id": request_id, "status": "APPLIED",
+                        "old_pid": os.getpid(), "new_pid": 98765,
+                    })
+
+                stdout, stderr = StringIO(), StringIO()
+                with patch("tah_control.cli.time.sleep", side_effect=respond):
+                    with redirect_stdout(stdout), redirect_stderr(stderr):
+                        self.assertEqual(reload_proxy_command(settings, 0), 0)
+                self.assertEqual(len(stdout.getvalue().splitlines()), 1)
+                self.assertEqual(json.loads(stdout.getvalue())["status"], "APPLIED")
+                for stage in ("REQUESTED", "PREFLIGHT", "STOPPING",
+                              "STARTING", "VERIFYING"):
+                    self.assertIn(stage, stderr.getvalue())
+                self.assertNotIn("PREFLIGHT", stdout.getvalue())
+
     def test_command_reports_success_and_does_not_signal_other_processes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
