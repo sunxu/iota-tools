@@ -168,7 +168,8 @@ def proxy_preflight(settings: Settings) -> None:
     env["IOTA_RELAY_CA_READY"] = "1" if relay_ca_available(settings) else "0"
     try:
         subprocess.run(
-            [sys.executable, "-B", "-c", "; ".join(f"import {name}" for name in modules)],
+            [sys.executable, "-B", "-c",
+             "; ".join(f"from {name} import addons" for name in modules)],
             cwd=ROOT, env=env, capture_output=True, check=True, timeout=15,
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
