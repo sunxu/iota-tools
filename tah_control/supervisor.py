@@ -169,13 +169,14 @@ class Supervisor:
         try:
             try:
                 previous = json.loads(path.read_text())
-                if previous.get("request_id") != request_id:
+                if not isinstance(previous, dict) or previous.get("request_id") != request_id:
                     previous = {}
             except (OSError, ValueError):
                 previous = {}
             events = previous.get("events", [])
             if not isinstance(events, list):
                 events = []
+            events = [event for event in events if isinstance(event, dict)]
             last_seq = previous.get("last_seq", 0)
             if not isinstance(last_seq, int) or last_seq < 0:
                 last_seq = 0
