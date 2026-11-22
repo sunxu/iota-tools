@@ -44,24 +44,29 @@ class ProxyActivity:
         self._heartbeat_task: asyncio.Task | None = None
 
     def _write(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        value = {
-            "process_pid": self.pid,
-            "timestamp": time.time(),
-            "build_id": self.build_id,
-            "active_http_flows": len(self.http),
-            "active_tcp_flows": len(self.tcp),
-            "active_websockets": len(self.websockets),
-            "active_tunnels": len(self.tunnels),
-        }
-        temporary = self.path.with_name(self.path.name + f".{self.pid}.tmp")
-        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
-            with os.fdopen(fd, "w") as stream:
-                json.dump(value, stream, separators=(",", ":"))
-            os.replace(temporary, self.path)
-        finally:
-            temporary.unlink(missing_ok=True)
+            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            value = {
+                "process_pid": self.pid,
+                "timestamp": time.time(),
+                "build_id": self.build_id,
+                "active_http_flows": len(self.http),
+                "active_tcp_flows": len(self.tcp),
+                "active_websockets": len(self.websockets),
+                "active_tunnels": len(self.tunnels),
+            }
+            temporary = self.path.with_name(self.path.name + f".{self.pid}.tmp")
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                with os.fdopen(fd, "w") as stream:
+                    json.dump(value, stream, separators=(",", ":"))
+                os.replace(temporary, self.path)
+            finally:
+                temporary.unlink(missing_ok=True)
+
+        except OSError:
+            # Status is advisory. Logging failures must never fail client traffic.
+            pass
 
     async def _heartbeat(self) -> None:
         while True:
