@@ -130,7 +130,7 @@ def start_speedtest(settings: Settings) -> subprocess.Popen | None:
 def _proxy_loader(confdir: Path, module: str) -> Path:
     """Keep watched -s files stable: imported addons change only on process restart."""
     path = confdir / ("entry-" + module.replace(".", "-") + ".py")
-    source = f"from {module} import addons\\n"
+    source = f"from {module} import addons\n"
     if not path.exists():
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as stream:
