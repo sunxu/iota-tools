@@ -127,7 +127,55 @@ def start_speedtest(settings: Settings) -> subprocess.Popen | None:
     )
 
 
-def start_proxy(settings: Settings) -> subprocess.Popen:
+def _proxy_loader(confdir: Path, module: str) -> Path:
+    """Keep watched -s files stable: imported addons change only on process restart."""
+    path = confdir / ("entry-" + module.replace(".", "-") + ".py")
+    source = f"from {module} import addons\n"
+    if not path.exists():
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as stream:
+            stream.write(source)
+    if path.is_symlink() or path.read_text() != source:
+        raise RuntimeError("invalid private mitmdump addon entrypoint")
+    return path
+
+
+def proxy_preflight(settings: Settings) -> None:
+    """Validate a candidate without touching the running proxy or its CA files."""
+    import subprocess
+
+    mitmdump_path()
+    runtime = ensure_runtime(settings)
+    if not (runtime / "mitmproxy" / "mitmproxy-ca-cert.pem").is_file():
+        raise RuntimeError("existing mitmproxy CA is missing")
+    if settings.section("r2")["enabled"] and (
+        not relay_ca_available(settings) or
+        not (runtime / "relay-upstream-ca.pem").is_file()
+    ):
+        raise RuntimeError("existing R2 relay trust bundle is missing")
+    modules = ["tah_control.proxy_activity"]
+    if settings.section("speedtest")["enabled"]:
+        modules.append("speedtest.addon")
+    if settings.section("r2")["enabled"]:
+        modules.append("r2_client.addon")
+    # Check the stable watched scripts while the old mitmdump still serves.
+    # A corrupted wrapper must fail preflight, not fail after the old stop.
+    for module in modules:
+        _proxy_loader(runtime / "mitmproxy", module)
+    env = clean_env()
+    env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["IOTA_RELAY_CA_READY"] = "1" if relay_ca_available(settings) else "0"
+    try:
+        subprocess.run(
+            [sys.executable, "-B", "-c", "; ".join(f"import {name}" for name in modules)],
+            cwd=ROOT, env=env, capture_output=True, check=True, timeout=15,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError("mitmdump addon preflight failed: " + type(exc).__name__) from None
+
+
+def start_proxy(settings: Settings, *, reload_only: bool = False) -> subprocess.Popen:
     port = settings.section("proxy")["port"]
     require_free_port(port)
     runtime = ensure_runtime(settings)
@@ -146,15 +194,16 @@ def start_proxy(settings: Settings) -> subprocess.Popen:
         "--set", "flow_detail=0",
         "--set", "termlog_verbosity=warn",
     ]
+    args.extend(["-s", str(_proxy_loader(confdir, "tah_control.proxy_activity"))])
     if settings.section("speedtest")["enabled"]:
-        args.extend(["-s", str(ROOT / "speedtest" / "addon.py")])
+        args.extend(["-s", str(_proxy_loader(confdir, "speedtest.addon"))])
     if settings.section("r2")["enabled"]:
-        args.extend(["-s", str(ROOT / "r2_client" / "addon.py")])
+        args.extend(["-s", str(_proxy_loader(confdir, "r2_client.addon"))])
     env = clean_env()
     env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     # Refresh trust from the current on-disk CA files BEFORE accepting uploads.
     # The very first launch only generates mitmproxy CA, then Supervisor restarts it.
-    if (runtime / "mitmproxy" / "mitmproxy-ca-cert.pem").is_file():
+    if not reload_only and (runtime / "mitmproxy" / "mitmproxy-ca-cert.pem").is_file():
         generate_cas(settings)
     trust_path = runtime / "relay-upstream-ca.pem"
     relay_ready = relay_ca_available(settings) and trust_path.is_file()
@@ -166,6 +215,17 @@ def start_proxy(settings: Settings) -> subprocess.Popen:
         env["IOTA_R2_UPSTREAM_CA"] = str(trust_path)
         args.extend(["--set", f"ssl_verify_upstream_trusted_ca={trust_path}"])
     return subprocess.Popen(args, cwd=ROOT, env=env, start_new_session=True)
+
+
+def stop_proxy_for_reload(proc: subprocess.Popen) -> None:
+    """Never escalate to SIGTERM/SIGKILL during a manual reload."""
+    if proc.poll() is not None:
+        return
+    proc.send_signal(signal.SIGINT)
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("old mitmdump did not stop gracefully") from None
 
 
 def wait_proxy(settings: Settings, proc: subprocess.Popen, seconds: float = 20) -> None:

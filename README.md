@@ -42,6 +42,22 @@ macOS IOTA 工具：版本化配置、单机常驻 Supervisor、独立 Speedtest
 
 安装用户 LaunchAgent 后默认自动启动；stop 会持久化停止意图，下一次登录也不重新启动 IOTA。uninstall 默认保留本机 CA、配置和 hosts；hosts 单独恢复。系统钥匙串和全局代理不会被自动修改。
 
+## 仅重载 mitmdump（手动操作）
+
+`reload-proxy` 不执行 Git 拉取、依赖安装或自动更新；由已运行的 Supervisor 仅重启其拥有的 mitmdump 子进程。IOTA、Supervisor、Speedtest 与 R2 Relay 不由这个命令操作。现有 `reload` 仍是 Supervisor 整体重载，含 IOTA 重启。
+
+```sh
+# 自行更新代码后再主动激活（命令本身不会更新）
+.venv/bin/python -m tah_control.cli reload-proxy
+# 繁忙时不等待；默认最多等待 120 秒，可用 --wait 300 自定义
+.venv/bin/python -m tah_control.cli reload-proxy --wait 0
+.venv/bin/python -m tah_control.cli status
+```
+
+执行时新配置和 Addon 通过预检后，Supervisor 检查 mitmdump 私有活动快照。存在正在处理的 HTTP、TCP、WebSocket 或非拦截 CONNECT 时等待或返回 `BUSY`；状态缺失/过期则拒绝重载。空闲后有一次复查，并使用原端口和现有 CA 启动新进程，校验新 PID、活动快照与 R2 下载 Relay 就绪。回执仅包含请求 ID、状态、旧新 PID、代码指纹及安全原因码；可能返回 `APPLIED`、`BUSY`、`PREFLIGHT_FAILED`、`FAILED`。失败不承诺旧代码自动回滚。
+
+这是**尽力避免中断的受控重启，不是零中断的连接迁移**：在检查后的极短竞态窗口中可能进入新请求，空闲连接也可能短暂断开。mitmproxy 使用持久的私有 Addon 入口脚本，Git 文件变化不会主动激活导入模块；只有新进程启动后加载更新代码。现有配置、CA 文件不会由 `reload-proxy` 修改。
+
 ## 版本化配置
 
 默认 `config/defaults.toml`；本机差异写 `~/.config/iota-tools/config.toml`，比如：
