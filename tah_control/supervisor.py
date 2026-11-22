@@ -152,6 +152,54 @@ class Supervisor:
         except (OSError, KeyError, TypeError, ValueError) as exc:
             raise RuntimeError("proxy activity is unavailable or stale") from None
 
+    def _reload_progress(
+        self, request_id: str, stage: str, *, old_pid: int,
+        new_pid: int | None = None, snapshot: dict | None = None,
+    ) -> None:
+        """Best-effort, request-scoped phase history; never block a reload on logs."""
+        path = self.s.runtime / "reload-proxy-progress.json"
+        counts = {}
+        if snapshot is not None:
+            counts = {
+                key: snapshot[key] for key in (
+                    "active_http_flows", "active_tcp_flows",
+                    "active_websockets", "active_tunnels"
+                )
+            }
+        try:
+            try:
+                previous = json.loads(path.read_text())
+                if previous.get("request_id") != request_id:
+                    previous = {}
+            except (OSError, ValueError):
+                previous = {}
+            events = previous.get("events", [])
+            if not isinstance(events, list):
+                events = []
+            last_seq = previous.get("last_seq", 0)
+            if not isinstance(last_seq, int) or last_seq < 0:
+                last_seq = 0
+            if not events or events[-1].get("stage") != stage:
+                last_seq += 1
+                events = (events + [{
+                    "seq": last_seq, "stage": stage,
+                    "old_pid": old_pid, "new_pid": new_pid,
+                    "counts": counts,
+                }])[-32:]
+            atomic_json(path, {
+                "request_id": request_id,
+                "stage": stage,
+                "timestamp": time.time(),
+                "last_seq": last_seq,
+                "events": events,
+                "counts": counts,
+                "old_pid": old_pid,
+                "new_pid": new_pid,
+            })
+        except (OSError, ValueError, TypeError, KeyError):
+            # Progress is diagnostic only. Never alter process-switch behavior.
+            pass
+
     def _reload_result(self, request_id: str, status: str, **details) -> None:
         # Remove the request *before* publishing its result so the next CLI
         # cannot lose a new request to an old request's cleanup.
@@ -208,11 +256,15 @@ class Supervisor:
         ))
         now = time.time()
         if busy:
+            self._reload_progress(request_id, "WAITING_BUSY",
+                                  old_pid=old_pid, snapshot=snapshot)
             self._reload_idle_since = None
             if now >= deadline:
                 self._reload_result(request_id, "BUSY", old_pid=old_pid,
                                     reason="ACTIVE_PROXY_TRAFFIC")
             return
+        self._reload_progress(request_id, "IDLE_CONFIRMING",
+                              old_pid=old_pid, snapshot=snapshot)
         if self._reload_idle_since is None:
             self._reload_idle_since = time.monotonic()
             if wait_seconds > 0 and now < deadline:
@@ -226,6 +278,7 @@ class Supervisor:
                                     reason="IDLE_WINDOW_NOT_REACHED")
             return
 
+        self._reload_progress(request_id, "PREFLIGHT", old_pid=old_pid)
         try:
             fresh = load_settings(self.s.source)
             if (fresh.section("proxy")["port"] != self.s.section("proxy")["port"]
@@ -238,6 +291,8 @@ class Supervisor:
                 "active_http_flows", "active_tcp_flows",
                 "active_websockets", "active_tunnels"
             )):
+                self._reload_progress(request_id, "WAITING_BUSY",
+                                      old_pid=old_pid, snapshot=recent)
                 self._reload_idle_since = None
                 if time.time() >= deadline:
                     self._reload_result(request_id, "BUSY", old_pid=old_pid,
@@ -250,11 +305,15 @@ class Supervisor:
 
         new_pid = None
         try:
+            self._reload_progress(request_id, "STOPPING", old_pid=old_pid)
             services.stop_proxy_for_reload(proc)
             self.proxy = None
+            self._reload_progress(request_id, "STARTING", old_pid=old_pid)
             new_proxy = services.start_proxy(fresh, reload_only=True)
             self.proxy = new_proxy
             new_pid = new_proxy.pid
+            self._reload_progress(request_id, "VERIFYING",
+                                  old_pid=old_pid, new_pid=new_pid)
             services.wait_proxy(fresh, new_proxy)
             # Verify actual addon startup, not just an open TCP listening port.
             until = time.monotonic() + 10
