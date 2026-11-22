@@ -294,12 +294,113 @@ class DownloadRouterUnitTests(unittest.IsolatedAsyncioTestCase):
             expected_stage="replacement_stream",
         )
 
-    async def test_replacement_prefix_validation_stall_does_not_fall_back(self):
-        await self._run_replacement_stall_case(
-            original_prefix=b"prefix",
-            replacement_prefix=b"",
-            expected_stage="prefix_validation",
+    async def test_replacement_prefix_validation_timeout_resumes_original(self):
+        body = b"original-response-after-prefix-timeout"
+        prefix = body[:8]
+        origin_resume = asyncio.Event()
+        replacement_release = asyncio.Event()
+        replacement_seen = asyncio.Event()
+        origin_requests = 0
+        replacement_requests = 0
+
+        async def origin(request):
+            nonlocal origin_requests
+            origin_requests += 1
+            response = web.StreamResponse(
+                status=200,
+                headers={"ETag": '"same-object"', "Content-Length": str(len(body)),
+                         "Content-Type": "application/octet-stream"},
+            )
+            await response.prepare(request)
+            await response.write(prefix)
+            await origin_resume.wait()
+            await response.write(body[len(prefix):])
+            await response.write_eof()
+            return response
+
+        async def replacement_proxy(request):
+            nonlocal replacement_requests
+            replacement_requests += 1
+            response = web.StreamResponse(
+                status=200,
+                headers={"ETag": '"same-object"', "Content-Length": str(len(body)),
+                         "Content-Type": "application/octet-stream"},
+            )
+            await response.prepare(request)
+            await response.write(prefix[:3])
+            replacement_seen.set()
+            await replacement_release.wait()
+            return response
+
+        async def start_server(handler):
+            app = web.Application()
+            app.router.add_route("*", "/{tail:.*}", handler)
+            runner = web.AppRunner(app, access_log=None)
+            await runner.setup()
+            site = web.TCPSite(runner, "127.0.0.1", 0)
+            await site.start()
+            return runner, site._server.sockets[0].getsockname()[1]
+
+        origin_runner, origin_port = await start_server(origin)
+        proxy_runner, proxy_port = await start_server(replacement_proxy)
+        self.router.replacement_proxy = f"http://127.0.0.1:{proxy_port}"
+        request_id = "prefix-timeout-original-fallback"
+        context = _RequestContext(
+            request_id=request_id,
+            url=f"http://127.0.0.1:{origin_port}/object",
+            headers=((b"Host", f"127.0.0.1:{origin_port}".encode()),),
+            client_id="prefix-timeout-test-client",
+            range_requested=False,
+            started=asyncio.get_running_loop().time(),
         )
+        self.router._contexts[request_id] = context
+        try:
+            with patch("r2_client.download._REPLACEMENT_STREAM_STALL_TIMEOUT", 0.05):
+                async with ClientSessionForTest() as client:
+                    response = await client.get(
+                        f"http://127.0.0.1:{self.router._port}/{request_id}",
+                        headers={
+                            "X-Iota-Download-Token": self.router._token,
+                            "X-Iota-Download-Request": request_id,
+                        },
+                    )
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(await response.content.readexactly(len(prefix)), prefix)
+                    await asyncio.wait_for(replacement_seen.wait(), timeout=3)
+
+                    async def wait_for_fallback():
+                        while self.router._stats["takeover_failed"] != 1:
+                            await asyncio.sleep(0.01)
+
+                    await asyncio.wait_for(wait_for_fallback(), timeout=3)
+                    origin_resume.set()
+                    self.assertEqual(
+                        prefix + await asyncio.wait_for(response.read(), timeout=3), body
+                    )
+
+            events = [
+                json.loads(line)
+                for line in self.router.event_history_path.read_text().splitlines()
+            ]
+            failed = next(e for e in events if e["result"] == "takeover_failed")
+            summary = next(e for e in events if e["result"] == "download_summary")
+            self.assertEqual(failed["stage"], "prefix_validation")
+            self.assertEqual(failed["reason"], "TimeoutError")
+            self.assertEqual(failed["prefix_validation_bytes"], 3)
+            self.assertEqual(summary["final_status"], "completed")
+            self.assertEqual(summary["delivered_bytes"], len(body))
+            self.assertEqual(summary["takeover_result"], "failed")
+            self.assertEqual(origin_requests, 1)
+            self.assertEqual(replacement_requests, 1)
+            self.assertEqual(self.router._stats["takeover_stream_stalled"], 0)
+            self.assertEqual(self.router._stats["takeover_slot_released"], 1)
+            self.assertEqual(self.router._active_takeovers, 0)
+            self.assertFalse(context.slot_reserved)
+        finally:
+            origin_resume.set()
+            replacement_release.set()
+            await origin_runner.cleanup()
+            await proxy_runner.cleanup()
 
     async def test_replacement_stream_data_resets_stall_timeout(self):
         body = b"abc"
