@@ -40,6 +40,20 @@ class ProxyActivityTests(unittest.TestCase):
             activity.client_disconnected(conn)
             self.assertEqual(json.loads(activity.path.read_text())["active_tunnels"], 0)
 
+    def test_activity_snapshot_write_failure_never_breaks_flow(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_settings = SimpleNamespace(runtime=Path(tmp))
+            with patch("tah_control.proxy_activity.load_settings", return_value=fake_settings):
+                activity = ProxyActivity()
+            flow = SimpleNamespace(
+                id="flow1", client_conn=SimpleNamespace(id="c1"),
+                request=SimpleNamespace(method="GET"),
+            )
+            with patch("tah_control.proxy_activity.os.open", side_effect=OSError("no space")):
+                activity.requestheaders(flow)
+            self.assertIn("flow1", activity.http)
+            self.assertFalse(activity.path.exists())
+
     def test_stable_loader_does_not_change_after_first_creation(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = services._proxy_loader(Path(tmp), "r2_client.addon")
@@ -153,6 +167,24 @@ class ReloadSupervisorTests(unittest.TestCase):
         self.assertEqual(self._result()["status"], "PREFLIGHT_FAILED")
         self.assertIs(self.supervisor.proxy, self.old_proc)
         stop.assert_not_called()
+
+    @patch("tah_control.supervisor.services.wait_proxy")
+    @patch("tah_control.supervisor.services.start_proxy")
+    @patch("tah_control.supervisor.services.stop_proxy_for_reload")
+    @patch("tah_control.supervisor.services.proxy_preflight")
+    def test_unhealthy_new_proxy_fails_without_reporting_success(
+        self, preflight, stop, start, wait
+    ):
+        self._activity()
+        self._request()
+        new = Mock()
+        new.pid = 32102
+        new.poll.return_value = 1  # New process exits before addon readiness.
+        start.return_value = new
+        self.supervisor._reload_proxy_tick()
+        self.assertEqual(self._result()["status"], "FAILED")
+        self.assertIsNone(self.supervisor.proxy)
+        stop.assert_called_once_with(self.old_proc)
 
     @patch("tah_control.supervisor.services.start_proxy",
            side_effect=RuntimeError("start failure"))
