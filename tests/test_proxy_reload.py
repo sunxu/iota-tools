@@ -56,6 +56,22 @@ class ProxyActivityTests(unittest.TestCase):
             self.assertIn("flow1", activity.http)
             self.assertFalse(activity.path.exists())
 
+    def test_speedtest_addon_exports_original_request_handler(self):
+        from speedtest import addon as speedtest_addon
+
+        self.assertEqual(len(speedtest_addon.addons), 1)
+        self.assertTrue(callable(speedtest_addon.addons[0].request))
+        flow = SimpleNamespace(
+            request=SimpleNamespace(
+                method="GET", host="www.speedtest.net",
+                url="https://www.speedtest.net/speedtest-servers-static.php",
+            ),
+            response=None,
+        )
+        speedtest_addon.addons[0].request(flow)
+        self.assertEqual(flow.response.status_code, 200)
+        self.assertEqual(flow.response.raw_content, speedtest_addon.SERVERS_XML)
+
     def test_stable_loader_does_not_change_after_first_creation(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = services._proxy_loader(Path(tmp), "r2_client.addon")
@@ -403,7 +419,7 @@ class RealMitmdumpSmokeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.dict(os.environ, {"HOME": tmp}):
                 settings = load_settings(Path(tmp) / "missing.toml")
-                settings.data["speedtest"]["enabled"] = False
+                # Keep Speedtest enabled: cover *all* production -s wrappers.
                 with socket.socket() as listener:
                     listener.bind(("127.0.0.1", 0))
                     settings.data["proxy"]["port"] = listener.getsockname()[1]
