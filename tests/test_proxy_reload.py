@@ -194,5 +194,54 @@ class ReloadCliTests(unittest.TestCase):
             reload_proxy_command(None, -1)
 
 
+class RealMitmdumpSmokeTests(unittest.TestCase):
+    @unittest.skipUnless(services.shutil.which("mitmdump"), "mitmdump is not installed")
+    def test_real_mitmdump_relaunch_loads_private_addons(self):
+        """Launch an isolated loopback proxy, never a real R2 GET or an IOTA app."""
+        import socket
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"HOME": tmp}):
+                settings = load_settings(Path(tmp) / "missing.toml")
+                settings.data["speedtest"]["enabled"] = False
+                with socket.socket() as listener:
+                    listener.bind(("127.0.0.1", 0))
+                    settings.data["proxy"]["port"] = listener.getsockname()[1]
+                proc = None
+                try:
+                    proc = services.start_proxy(settings)
+                    services.wait_proxy(settings, proc, seconds=20)
+                    deadline = time.monotonic() + 12
+                    while True:
+                        try:
+                            activity = json.loads(
+                                (settings.runtime / "proxy-activity.json").read_text()
+                            )
+                            download = json.loads(
+                                (settings.runtime / "r2-download-status.json").read_text()
+                            )
+                            if (activity["process_pid"] == proc.pid
+                                    and download["process_pid"] == proc.pid
+                                    and download["relay_ready"]):
+                                break
+                        except (OSError, KeyError, ValueError):
+                            pass
+                        if proc.poll() is not None or time.monotonic() >= deadline:
+                            self.fail("real mitmdump addons did not become ready")
+                        time.sleep(0.2)
+                    self.assertEqual(activity["active_http_flows"], 0)
+                    ca = settings.runtime / "mitmproxy" / "mitmproxy-ca-cert.pem"
+                    ca_original = ca.read_bytes()
+                    old_pid = proc.pid
+                    services.stop_proxy_for_reload(proc)
+                    proc = services.start_proxy(settings, reload_only=True)
+                    services.wait_proxy(settings, proc, seconds=20)
+                    self.assertNotEqual(proc.pid, old_pid)
+                    self.assertEqual(ca.read_bytes(), ca_original)
+                finally:
+                    if proc is not None:
+                        services.stop_owned(proc)
+
+
 if __name__ == "__main__":
     unittest.main()
