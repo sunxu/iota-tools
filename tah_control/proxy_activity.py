@@ -38,8 +38,8 @@ class ProxyActivity:
         self.pid = os.getpid()
         self.build_id = proxy_build_id()
         self.http: dict[str, str] = {}
-        self.tcp: set[str] = set()
-        self.websockets: set[str] = set()
+        self.tcp: dict[str, str] = {}
+        self.websockets: dict[str, str] = {}
         self.tunnels: set[str] = set()
         self._heartbeat_task: asyncio.Task | None = None
 
@@ -105,26 +105,28 @@ class ProxyActivity:
         ident = str(getattr(client, "id", ""))
         self.tunnels.discard(ident)
         self.http = {key: value for key, value in self.http.items() if value != ident}
+        self.tcp = {key: value for key, value in self.tcp.items() if value != ident}
+        self.websockets = {key: value for key, value in self.websockets.items() if value != ident}
         self._write()
 
     def tcp_start(self, flow) -> None:
-        self.tcp.add(str(flow.id))
+        self.tcp[str(flow.id)] = self._client_id(flow)
         self._write()
 
     def tcp_end(self, flow) -> None:
-        self.tcp.discard(str(flow.id))
+        self.tcp.pop(str(flow.id), None)
         self._write()
 
     def tcp_error(self, flow) -> None:
-        self.tcp.discard(str(flow.id))
+        self.tcp.pop(str(flow.id), None)
         self._write()
 
     def websocket_start(self, flow) -> None:
-        self.websockets.add(str(flow.id))
+        self.websockets[str(flow.id)] = self._client_id(flow)
         self._write()
 
     def websocket_end(self, flow) -> None:
-        self.websockets.discard(str(flow.id))
+        self.websockets.pop(str(flow.id), None)
         self._write()
 
     async def done(self) -> None:
