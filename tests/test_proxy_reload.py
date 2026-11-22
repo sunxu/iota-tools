@@ -122,6 +122,17 @@ class ReloadSupervisorTests(unittest.TestCase):
         self.assertEqual(self._result()["reason"], "ACTIVITY_UNAVAILABLE")
         stop.assert_not_called()
 
+    @patch("tah_control.supervisor.services.stop_proxy_for_reload")
+    @patch("tah_control.supervisor.services.proxy_preflight")
+    def test_preflight_rechecks_new_traffic_before_stop(self, preflight, stop):
+        self._activity()
+        self._request(wait=0)
+        preflight.side_effect = lambda settings: self._activity(http=1)
+        self.supervisor._reload_proxy_tick()
+        self.assertEqual(self._result()["status"], "BUSY")
+        stop.assert_not_called()
+        self.assertIs(self.supervisor.proxy, self.old_proc)
+
     @patch("tah_control.supervisor.services.wait_proxy")
     @patch("tah_control.supervisor.services.start_proxy")
     @patch("tah_control.supervisor.services.stop_proxy_for_reload")
