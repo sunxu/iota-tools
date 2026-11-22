@@ -278,8 +278,18 @@ class Supervisor:
                                 old_build_id=snapshot["build_id"],
                                 new_build_id=active["build_id"])
         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
-            # No automatic code rollback. The ordinary Supervisor recovery loop
-            # remains responsible for later restarts of a failed new process.
+            # Do not leave an unhealthy newly launched mitmdump running and
+            # mistakenly treat it as healthy on later Supervisor ticks.
+            if (new_pid is not None and self.proxy is not None
+                    and self.proxy.pid == new_pid):
+                if self.proxy.poll() is None:
+                    try:
+                        services.stop_proxy_for_reload(self.proxy)
+                    except (OSError, RuntimeError):
+                        pass
+                if self.proxy.poll() is not None:
+                    self.proxy = None
+            # No automatic code rollback. Ordinary recovery can try again.
             self._reload_result(request_id, "FAILED", old_pid=old_pid,
                                 new_pid=new_pid, reason=type(exc).__name__)
 
