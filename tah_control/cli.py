@@ -88,7 +88,7 @@ def _report_reload_progress(
             continue
         seq, stage = event.get("seq"), event.get("stage")
         if (type(seq) is not int or seq <= seen_seq
-                or stage not in _RELOAD_PROGRESS_STAGES):
+                or type(stage) is not str or stage not in _RELOAD_PROGRESS_STAGES):
             continue
         message = _reload_progress_line(
             stage, event.get("counts"), event.get("old_pid"),
@@ -97,7 +97,8 @@ def _report_reload_progress(
         print(f"[{minute:02}:{second:02}] {message}", file=sys.stderr, flush=True)
         seen_seq = seq
         last_output_at = elapsed
-    if (progress.get("stage") in _RELOAD_WAIT_STAGES
+    if (type(progress.get("stage")) is str
+            and progress["stage"] in _RELOAD_WAIT_STAGES
             and last_output_at >= 0 and elapsed - last_output_at >= 10):
         stage = progress["stage"]
         message = _reload_progress_line(
