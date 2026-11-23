@@ -63,7 +63,7 @@ class SettingsTests(unittest.TestCase):
                 ("r2.download", "slow_window_seconds", 121),
             ):
                 with self.subTest(section=section, key=key):
-                    p.write_text(f"[{section}]\\n{key}={value}\\n")
+                    p.write_text(f"[{section}]\n{key}={value}\n")
                     self.assertEqual(load_settings(p).section(*section.split("."))[key], value)
 
     def test_schema_and_ranges(self):
