@@ -38,8 +38,9 @@ class SettingsTests(unittest.TestCase):
             self.assertIs(load_settings(p).section("r2", "download")["capture_requests"], False)
             for invalid in (
                 "[r2.download]\nmax_concurrent_takeovers=0\n",
-                "[r2.download]\nmax_concurrent_takeovers=65\n",
                 "[r2.download]\nslow_threshold_kib_s=0\n",
+                "[r2.download]\nslow_window_seconds=0\n",
+                "[r2.download]\nmax_concurrent_takeovers=-1\n",
                 "[r2.download]\ndirect_takeover_threshold_mib=0\n",
                 "[r2.download]\ndirect_takeover_threshold_mib=-1\n",
                 "[r2.download]\ndirect_takeover_threshold_mib=1.5\n",
@@ -50,10 +51,25 @@ class SettingsTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     load_settings(p)
 
+    def test_values_above_previous_fixed_maxima(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "local.toml"
+            for section, key, value in (
+                ("r2.upload", "max_concurrency", 101),
+                ("r2.upload", "fallback_max_concurrency", 101),
+                ("r2.download", "max_concurrent_takeovers", 65),
+                ("r2.download", "slow_threshold_kib_s", 100001),
+                ("r2.download", "slow_window_seconds", 121),
+            ):
+                with self.subTest(section=section, key=key):
+                    p.write_text(f"[{section}]\n{key}={value}\n")
+                    self.assertEqual(load_settings(p).section(*section.split("."))[key], value)
+
     def test_schema_and_ranges(self):
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "local.toml"
             for invalid in ("schema_version=2\n", "[r2.upload]\nmax_concurrency=0\n",
+                            "[r2.upload]\nfallback_max_concurrency=0\n",
                             "[proxy]\nport=8877\n", "[speedtest]\nmbps=1000\n"):
                 p.write_text(invalid)
                 with self.assertRaises(ValueError):
