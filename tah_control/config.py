@@ -89,7 +89,7 @@ class Settings:
             raise ValueError("primary and fallback must differ")
         for name in ("max_concurrency", "fallback_max_concurrency"):
             if type(up[name]) is not int or up[name] < 1:
-                raise ValueError(f"r2.upload.{name} out of range")
+                raise ValueError(f"r2.upload.{name} must be a positive integer")
         for name in ("probe_interval_seconds", "probe_timeout_seconds"):
             if type(up[name]) not in (int, float) or up[name] <= 0:
                 raise ValueError(f"r2.upload.{name} must be positive")
@@ -99,10 +99,10 @@ class Settings:
             raise ValueError("r2.download.enabled must be boolean")
         if (type(down["slow_threshold_kib_s"]) is not int
                 or down["slow_threshold_kib_s"] < 1):
-            raise ValueError("r2.download.slow_threshold_kib_s out of range")
+            raise ValueError("r2.download.slow_threshold_kib_s must be a positive integer")
         if (type(down["slow_window_seconds"]) is not int
                 or down["slow_window_seconds"] < 1):
-            raise ValueError("r2.download.slow_window_seconds out of range")
+            raise ValueError("r2.download.slow_window_seconds must be a positive integer")
         if (type(down["direct_takeover_threshold_mib"]) is not int
                 or down["direct_takeover_threshold_mib"] <= 0):
             raise ValueError("r2.download.direct_takeover_threshold_mib must be a positive integer")
