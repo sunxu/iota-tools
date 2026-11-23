@@ -41,7 +41,6 @@ class SettingsTests(unittest.TestCase):
                 "[r2.download]\nslow_threshold_kib_s=0\n",
                 "[r2.download]\nslow_window_seconds=0\n",
                 "[r2.download]\nmax_concurrent_takeovers=-1\n",
-
                 "[r2.download]\ndirect_takeover_threshold_mib=0\n",
                 "[r2.download]\ndirect_takeover_threshold_mib=-1\n",
                 "[r2.download]\ndirect_takeover_threshold_mib=1.5\n",
